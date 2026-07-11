@@ -1,0 +1,593 @@
+--- /tmp/orig/dlls/wined3d/utils.c	2026-07-10 20:08:05.134243805 +0900
++++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/wined3d/utils.c	2026-05-16 15:45:06.031112270 +0900
+@@ -65,6 +65,7 @@
+     {WINED3DFMT_AL16,         WINED3D_FORMAT_FOURCC_BASE + 21},
+     {WINED3DFMT_NV12,         WINED3D_FORMAT_FOURCC_BASE + 22},
+     {WINED3DFMT_ATOC,         WINED3D_FORMAT_FOURCC_BASE + 23},
++    {WINED3DFMT_NV12_PLANAR,  WINED3D_FORMAT_FOURCC_BASE + 24},
+ };
+ 
+ #define WINED3D_FORMAT_COUNT (WINED3D_FORMAT_FOURCC_BASE + ARRAY_SIZE(format_index_remap))
+@@ -98,6 +99,9 @@
+     {WINED3DFMT_MULTI2_ARGB8,               0,  0,  0,  0,   0,  0,  0,  0,    1,   0,  0},
+     {WINED3DFMT_G8R8_G8B8,                  0,  0,  0,  0,   0,  0,  0,  0,    1,   0,  0},
+     {WINED3DFMT_R8G8_B8G8,                  0,  0,  0,  0,   0,  0,  0,  0,    1,   0,  0},
++    /* DXGI 10/11 sequential enum equivalents of packed YUV FourCC formats [AviUtl2 v12.7-STAGING] */
++    {WINED3DFMT_R8G8_B8G8_UNORM,            0,  0,  0,  0,   0,  0,  0,  0,    2,   0,  0},
++    {WINED3DFMT_G8R8_G8B8_UNORM,            0,  0,  0,  0,   0,  0,  0,  0,    2,   0,  0},
+     /* Hmm? */
+     {WINED3DFMT_R8G8_SNORM_Cx,              0,  0,  0,  0,   0,  0,  0,  0,    2,   0,  0},
+     {WINED3DFMT_R11G11B10_FLOAT,           11, 11, 10,  0,   0, 11, 22,  0,    4,   0,  0,   "FFF"},
+@@ -944,6 +948,46 @@
+     }
+ }
+ 
++/* [AviUtl2 v12.7-STAGING] G8R8_G8B8_UNORM packed 4:2:2 YUV upload converter.
++ * D3D11 samples G8R8_G8B8_UNORM as (.r=Cb, .g=Y, .b=Cr, .a=Y1).
++ * GL_RGBA8 stores bytes in order: byte0→.r, byte1→.g, byte2→.b, byte3→.a.
++ * Source macropixel layout: [Y0, Cb, Y1, Cr] (4 bytes = 2 pixels).
++ * We rearrange to: pixel0=[Cb, Y0, Cr, 255], pixel1=[Cb, Y1, Cr, 255]
++ * giving GL .r=Cb ✓, .g=Y ✓, .b=Cr ✓, .a=1 for both pixels. */
++static void convert_g8r8_g8b8_unorm(const BYTE *src, BYTE *dst, UINT src_row_pitch, UINT src_slice_pitch,
++        UINT dst_row_pitch, UINT dst_slice_pitch, UINT width, UINT height, UINT depth)
++{
++    unsigned int x, y, z;
++
++    for (z = 0; z < depth; z++)
++    {
++        for (y = 0; y < height; y++)
++        {
++            const BYTE *src_row = src + z * src_slice_pitch + y * src_row_pitch;
++            BYTE *dst_row = dst + z * dst_slice_pitch + y * dst_row_pitch;
++
++            for (x = 0; x < width; x += 2)
++            {
++                BYTE y0 = src_row[2 * x];      /* G = Y0 luma */
++                BYTE cb = src_row[2 * x + 1];  /* R = Cb chroma */
++                BYTE y1 = src_row[2 * x + 2];  /* G = Y1 luma */
++                BYTE cr = src_row[2 * x + 3];  /* B = Cr chroma */
++
++                /* pixel x+0: R=Cb, G=Y0, B=Cr, A=255 */
++                dst_row[4 * x]     = cb;
++                dst_row[4 * x + 1] = y0;
++                dst_row[4 * x + 2] = cr;
++                dst_row[4 * x + 3] = 255;
++                /* pixel x+1: R=Cb, G=Y1, B=Cr, A=255 */
++                dst_row[4 * x + 4] = cb;
++                dst_row[4 * x + 5] = y1;
++                dst_row[4 * x + 6] = cr;
++                dst_row[4 * x + 7] = 255;
++            }
++        }
++    }
++}
++
+ static void convert_r8g8_snorm(const BYTE *src, BYTE *dst, UINT src_row_pitch, UINT src_slice_pitch,
+         UINT dst_row_pitch, UINT dst_slice_pitch, UINT width, UINT height, UINT depth)
+ {
+@@ -1285,6 +1329,14 @@
+             GL_ALPHA,                   GL_UNSIGNED_BYTE,                 0,
+             WINED3D_FORMAT_CAP_FILTERING,
+             WINED3D_GL_LEGACY_CONTEXT,  NULL},
++    {WINED3DFMT_NV12_PLANAR,           GL_R8,                            GL_R8,                                  0,
++            GL_RED,                     GL_UNSIGNED_BYTE,                 0,
++            WINED3D_FORMAT_CAP_FILTERING,
++            ARB_TEXTURE_RG,             NULL},
++    {WINED3DFMT_NV12_PLANAR,           GL_ALPHA8,                        GL_ALPHA8,                              0,
++            GL_ALPHA,                   GL_UNSIGNED_BYTE,                 0,
++            WINED3D_FORMAT_CAP_FILTERING,
++            WINED3D_GL_LEGACY_CONTEXT,  NULL},
+     {WINED3DFMT_DXT1,                   GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT, 0,
+             GL_RGBA,                    GL_UNSIGNED_BYTE,                 0,
+             WINED3D_FORMAT_CAP_TEXTURE | WINED3D_FORMAT_CAP_POSTPIXELSHADER_BLENDING | WINED3D_FORMAT_CAP_FILTERING
+@@ -1524,6 +1576,17 @@
+             WINED3D_FORMAT_CAP_TEXTURE | WINED3D_FORMAT_CAP_POSTPIXELSHADER_BLENDING | WINED3D_FORMAT_CAP_FILTERING
+             | WINED3D_FORMAT_CAP_RENDERTARGET,
+             ARB_TEXTURE_RG,             NULL},
++/* [AviUtl2 v12.7-STAGING] Packed YUV 4:2:2 DXGI sequential formats - mapped to GL_RGBA8
++ * Each macropixel [Y0, Cb, Y1, Cr] = 4 bytes for 2 pixels.
++ * Output: pixel0=(R=Cb, G=Y0, B=Cr, A=1), pixel1=(R=Cb, G=Y1, B=Cr, A=1). */
++    {WINED3DFMT_G8R8_G8B8_UNORM,        GL_RGBA8,                         GL_RGBA8,                               0,
++            GL_RGBA,                    GL_UNSIGNED_BYTE,                 4,
++            WINED3D_FORMAT_CAP_TEXTURE | WINED3D_FORMAT_CAP_FILTERING,
++            ARB_TEXTURE_RG,             convert_g8r8_g8b8_unorm},
++    {WINED3DFMT_R8G8_B8G8_UNORM,        GL_RG8,                           GL_RG8,                                 0,
++            GL_RG,                      GL_UNSIGNED_BYTE,                 0,
++            WINED3D_FORMAT_CAP_TEXTURE | WINED3D_FORMAT_CAP_FILTERING,
++            ARB_TEXTURE_RG,             NULL},
+     {WINED3DFMT_R8G8_UINT,              GL_RG8UI,                         GL_RG8UI,                               0,
+             GL_RG_INTEGER,              GL_UNSIGNED_BYTE,                 0,
+             WINED3D_FORMAT_CAP_TEXTURE | WINED3D_FORMAT_CAP_RENDERTARGET,
+@@ -3504,6 +3567,15 @@
+         format->f.height_scale.numerator = 3;
+         format->f.height_scale.denominator = 2;
+         format->f.color_fixup = create_complex_fixup_desc(COMPLEX_FIXUP_NV12);
++
++        format = get_format_gl_internal(adapter, WINED3DFMT_NV12_PLANAR);
++        if (format)
++        {
++            format->f.attrs |= WINED3D_FORMAT_ATTR_HEIGHT_SCALE;
++            format->f.height_scale.numerator = 3;
++            format->f.height_scale.denominator = 2;
++            format->f.color_fixup = create_complex_fixup_desc(COMPLEX_FIXUP_NV12);
++        }
+     }
+     else
+     {
+@@ -3514,6 +3586,13 @@
+         format = get_format_gl_internal(adapter, WINED3DFMT_NV12);
+         format_clear_caps(&format->f, WINED3D_FORMAT_CAP_BLIT);
+         format->internal = 0;
++
++        format = get_format_gl_internal(adapter, WINED3DFMT_NV12_PLANAR);
++        if (format)
++        {
++            format_clear_caps(&format->f, WINED3D_FORMAT_CAP_BLIT);
++            format->internal = 0;
++        }
+     }
+ 
+     if (gl_info->supported[ARB_FRAGMENT_PROGRAM] || gl_info->supported[ARB_FRAGMENT_SHADER])
+@@ -4085,6 +4164,48 @@
+ 
+     if (!init_typeless_formats(adapter)) goto fail;
+ 
++    /* [AviUtl2] Force capabilities for NV12 and NV12_PLANAR to allow CreateTexture2D without fallback */
++    {
++        struct wined3d_format *nv12_fmt = get_format_internal(adapter, WINED3DFMT_NV12);
++        if (nv12_fmt)
++        {
++            nv12_fmt->caps[WINED3D_GL_RES_TYPE_TEX_2D] |= WINED3D_FORMAT_CAP_TEXTURE | WINED3D_FORMAT_CAP_BLIT;
++            WARN("Force-set capabilities for Format 69 (NV12) and custom YUV formats [v12.7-STAGING].\n");
++        }
++        /* Debug: print enum value and idx for NV12_PLANAR [v12.7-STAGING] */
++        {
++            int planar_idx = get_format_idx(WINED3DFMT_NV12_PLANAR);
++            WARN("NV12_PLANAR enum_val=%u idx=%d FOURCC_BASE=%u format_size=%u [v12.7-STAGING]\n",
++                (unsigned)WINED3DFMT_NV12_PLANAR, planar_idx,
++                (unsigned)WINED3D_FORMAT_FOURCC_BASE, (unsigned)adapter->format_size);
++        }
++        struct wined3d_format *nv12_planar = get_format_internal(adapter, WINED3DFMT_NV12_PLANAR);
++        WARN("NV12_PLANAR ptr=%p id=%u byte_count=%u attrs=%x [v12.7-STAGING]\n",
++            (void*)nv12_planar,
++            nv12_planar ? (unsigned)nv12_planar->id : 0xDEAD,
++            nv12_planar ? (unsigned)nv12_planar->byte_count : 0,
++            nv12_planar ? nv12_planar->attrs : 0);
++        if (nv12_planar)
++        {
++            /* Force-initialize NV12_PLANAR fields if not set (id=0 means uninitialized) [v12.7-STAGING] */
++            if (!nv12_planar->id)
++            {
++                WARN("NV12_PLANAR format struct is uninitialized (id=0)! Force-initializing [v12.7-STAGING].\n");
++                nv12_planar->id = WINED3DFMT_NV12_PLANAR;
++                nv12_planar->byte_count = 1;
++                nv12_planar->block_width = 1;
++                nv12_planar->block_height = 1;
++                nv12_planar->block_byte_count = 1;
++                nv12_planar->attrs |= WINED3D_FORMAT_ATTR_PLANAR;
++                nv12_planar->plane_formats[0] = WINED3DFMT_R8_UINT;
++                nv12_planar->plane_formats[1] = WINED3DFMT_R8G8_UINT;
++                nv12_planar->uv_width = 2;
++                nv12_planar->uv_height = 2;
++            }
++            nv12_planar->caps[WINED3D_GL_RES_TYPE_TEX_2D] |= WINED3D_FORMAT_CAP_TEXTURE | WINED3D_FORMAT_CAP_BLIT;
++        }
++    }
++
+     return TRUE;
+ 
+ fail:
+@@ -4181,8 +4302,10 @@
+         {WINED3DFMT_R32_FLOAT_X8X24_TYPELESS,   VK_FORMAT_D32_SFLOAT_S8_UINT,      },
+         {WINED3DFMT_X32_TYPELESS_G8X24_UINT,    VK_FORMAT_D32_SFLOAT_S8_UINT,      },
+         {WINED3DFMT_D24_UNORM_S8_UINT,          VK_FORMAT_D24_UNORM_S8_UINT,       },
+-        {WINED3DFMT_NV12_PLANAR,                VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,},
+-    };
++    {WINED3DFMT_NV12_PLANAR,                VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,},
++    {WINED3DFMT_NV12,                       VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,},
++    {WINED3DFMT_G8R8_G8B8_UNORM,            VK_FORMAT_R8G8B8A8_UNORM,},
++};
+     const struct wined3d_d3d_info *d3d_info = &adapter->d3d_info;
+     VkFormat vk_format = VK_FORMAT_UNDEFINED;
+     VkImageFormatProperties image_properties;
+@@ -4222,6 +4345,12 @@
+     else
+         format->f.color_fixup = COLOR_FIXUP_IDENTITY;
+ 
++    if (format->f.id == WINED3DFMT_G8R8_G8B8_UNORM)
++    {
++        format->f.upload = convert_g8r8_g8b8_unorm;
++        format->f.conv_byte_count = 4;
++    }
++
+     VK_CALL(vkGetPhysicalDeviceFormatProperties(vk_physical_device, vk_format, &properties));
+     if (vk_format == VK_FORMAT_D24_UNORM_S8_UINT)
+     {
+--- /tmp/orig/dlls/wined3d/swapchain.c	2026-07-10 20:08:05.705721538 +0900
++++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/wined3d/swapchain.c	2026-07-05 13:44:15.183414762 +0900
+@@ -912,20 +912,32 @@
+     RECT client_rect;
+     VkResult vr;
+ 
++    VkSwapchainKHR old_swapchain = swapchain_vk->vk_swapchain;
++    void *old_semaphores = swapchain_vk->vk_semaphores;
++    VkImage *old_images = swapchain_vk->vk_images;
++    unsigned int old_image_count = swapchain_vk->image_count;
++
+     adapter_vk = wined3d_adapter_vk(device_vk->d.adapter);
+     vk_info = &adapter_vk->vk_info;
+ 
+-    surface_desc.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+-    surface_desc.pNext = NULL;
+-    surface_desc.flags = 0;
+-    surface_desc.hinstance = (HINSTANCE)GetWindowLongPtrW(swapchain_vk->s.win_handle, GWLP_HINSTANCE);
+-    surface_desc.hwnd = swapchain_vk->s.win_handle;
+-    if ((vr = VK_CALL(vkCreateWin32SurfaceKHR(vk_info->instance, &surface_desc, NULL, &vk_surface))) < 0)
++    if (!swapchain_vk->vk_surface)
++    {
++        surface_desc.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
++        surface_desc.pNext = NULL;
++        surface_desc.flags = 0;
++        surface_desc.hinstance = (HINSTANCE)GetWindowLongPtrW(swapchain_vk->s.win_handle, GWLP_HINSTANCE);
++        surface_desc.hwnd = swapchain_vk->s.win_handle;
++        if ((vr = VK_CALL(vkCreateWin32SurfaceKHR(vk_info->instance, &surface_desc, NULL, &vk_surface))) < 0)
++        {
++            ERR("Failed to create Vulkan surface, vr %s.\n", wined3d_debug_vkresult(vr));
++            return E_FAIL;
++        }
++        swapchain_vk->vk_surface = vk_surface;
++    }
++    else
+     {
+-        ERR("Failed to create Vulkan surface, vr %s.\n", wined3d_debug_vkresult(vr));
+-        return E_FAIL;
++        vk_surface = swapchain_vk->vk_surface;
+     }
+-    swapchain_vk->vk_surface = vk_surface;
+ 
+     if ((vr = VK_CALL(vkGetPhysicalDeviceSurfaceSupportKHR(adapter_vk->physical_device,
+             device_vk->graphics_queue.vk_queue_family_index, vk_surface, &supported))) < 0 || !supported)
+@@ -992,7 +1004,9 @@
+     vk_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+     if (!swapchain_vk->s.swap_interval)
+     {
+-        if (wined3d_swapchain_vk_present_mode_supported(swapchain_vk, VK_PRESENT_MODE_IMMEDIATE_KHR))
++        if (wined3d_swapchain_vk_present_mode_supported(swapchain_vk, VK_PRESENT_MODE_MAILBOX_KHR))
++            vk_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
++        else if (wined3d_swapchain_vk_present_mode_supported(swapchain_vk, VK_PRESENT_MODE_IMMEDIATE_KHR))
+             vk_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+         else
+             FIXME("Unsupported swap interval %u.\n", swapchain_vk->s.swap_interval);
+@@ -1016,7 +1030,7 @@
+     vk_swapchain_desc.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+     vk_swapchain_desc.presentMode = vk_present_mode;
+     vk_swapchain_desc.clipped = VK_TRUE;
+-    vk_swapchain_desc.oldSwapchain = VK_NULL_HANDLE;
++    vk_swapchain_desc.oldSwapchain = old_swapchain;
+     if ((vr = VK_CALL(vkCreateSwapchainKHR(device_vk->vk_device, &vk_swapchain_desc, NULL, &vk_swapchain))) < 0)
+     {
+         ERR("Failed to create Vulkan swapchain, vr %s.\n", wined3d_debug_vkresult(vr));
+@@ -1027,17 +1041,42 @@
+     if (!wined3d_swapchain_vk_create_vulkan_swapchain_images(swapchain_vk, vk_swapchain))
+     {
+         VK_CALL(vkDestroySwapchainKHR(device_vk->vk_device, vk_swapchain, NULL));
++        swapchain_vk->vk_swapchain = old_swapchain;
+         goto fail;
+     }
+ 
+     swapchain_vk->width = width;
+     swapchain_vk->height = height;
+ 
++    if (old_swapchain)
++    {
++        unsigned int i;
++        void *new_semaphores = swapchain_vk->vk_semaphores;
++        if ((vr = VK_CALL(vkQueueWaitIdle(device_vk->graphics_queue.vk_queue))) < 0)
++            ERR("Failed to wait on queue, vr %s.\n", wined3d_debug_vkresult(vr));
++
++        free(old_images);
++        
++        swapchain_vk->vk_semaphores = old_semaphores;
++        for (i = 0; i < old_image_count; ++i)
++        {
++            VK_CALL(vkDestroySemaphore(device_vk->vk_device, swapchain_vk->vk_semaphores[i].available, NULL));
++            VK_CALL(vkDestroySemaphore(device_vk->vk_device, swapchain_vk->vk_semaphores[i].presentable, NULL));
++        }
++        free(swapchain_vk->vk_semaphores);
++        
++        swapchain_vk->vk_semaphores = new_semaphores;
++        VK_CALL(vkDestroySwapchainKHR(device_vk->vk_device, old_swapchain, NULL));
++    }
++
+     return WINED3D_OK;
+ 
+ fail:
+-    VK_CALL(vkDestroySurfaceKHR(vk_info->instance, vk_surface, NULL));
+-    swapchain_vk->vk_surface = 0;
++    if (!old_swapchain)
++    {
++        VK_CALL(vkDestroySurfaceKHR(vk_info->instance, vk_surface, NULL));
++        swapchain_vk->vk_surface = 0;
++    }
+     return E_FAIL;
+ }
+ 
+@@ -1045,8 +1084,6 @@
+ {
+     TRACE("swapchain_vk %p.\n", swapchain_vk);
+ 
+-    wined3d_swapchain_vk_destroy_vulkan_swapchain(swapchain_vk);
+-
+     return wined3d_swapchain_vk_create_vulkan_swapchain(swapchain_vk);
+ }
+ 
+@@ -1094,8 +1131,15 @@
+ 
+     present_idx = swapchain_vk->current++ % swapchain_vk->image_count;
+     wined3d_context_vk_wait_command_buffer(context_vk, swapchain_vk->vk_semaphores[present_idx].command_buffer_id);
+-    if ((vr = VK_CALL(vkAcquireNextImageKHR(device_vk->vk_device, swapchain_vk->vk_swapchain, UINT64_MAX,
+-            swapchain_vk->vk_semaphores[present_idx].available, VK_NULL_HANDLE, &image_idx))) < 0)
++    vr = VK_CALL(vkAcquireNextImageKHR(device_vk->vk_device, swapchain_vk->vk_swapchain,
++            0, /* 0 timeout - never block the CS thread, drop frame if busy */
++            swapchain_vk->vk_semaphores[present_idx].available, VK_NULL_HANDLE, &image_idx));
++    if (vr == VK_TIMEOUT || vr == VK_NOT_READY)
++    {
++        TRACE("Acquire image not ready, dropping frame, vr %s.\n", wined3d_debug_vkresult(vr));
++        return VK_TIMEOUT;
++    }
++    if (vr < 0)
+     {
+         WARN("Failed to acquire image, vr %s.\n", wined3d_debug_vkresult(vr));
+         return vr;
+@@ -1125,7 +1169,7 @@
+ 
+     wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
+             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+-            vk_access_mask_from_bind_flags(back_buffer_vk->t.resource.bind_flags),
++            vk_access_mask_from_bind_flags(back_buffer_vk->t.resource.bind_flags) | VK_ACCESS_TRANSFER_WRITE_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT,
+             back_buffer_vk->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+             back_buffer_vk->image.vk_image, &vk_range);
+@@ -1133,7 +1177,7 @@
+     wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
+             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             0, VK_ACCESS_TRANSFER_WRITE_BIT,
+-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+             swapchain_vk->vk_images[image_idx], &vk_range);
+ 
+     blit.srcSubresource.aspectMask = vk_range.aspectMask;
+@@ -1165,17 +1209,15 @@
+             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+             swapchain_vk->vk_images[image_idx], &vk_range);
+ 
+-    if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
+-        vk_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+-    else
+-        vk_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    vk_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+     wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
+             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT,
+             vk_access_mask_from_bind_flags(back_buffer_vk->t.resource.bind_flags),
+             vk_layout, back_buffer_vk->layout,
+             back_buffer_vk->image.vk_image, &vk_range);
+-    back_buffer_vk->bind_mask = 0;
++    if (desc->swap_effect != WINED3D_SWAP_EFFECT_DISCARD && desc->swap_effect != WINED3D_SWAP_EFFECT_FLIP_DISCARD)
++        back_buffer_vk->bind_mask = 0;
+ 
+     swapchain_vk->vk_semaphores[present_idx].command_buffer_id = context_vk->current_command_buffer.id;
+     wined3d_context_vk_submit_command_buffer(context_vk,
+@@ -1208,7 +1250,8 @@
+ 
+     static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
+ 
+-    if (swapchain->state.desc.backbuffer_count < 2)
++    if (swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_DISCARD
++            || swapchain->state.desc.backbuffer_count < 2)
+         return;
+ 
+     texture_prev = wined3d_texture_vk(swapchain->back_buffers[0]);
+@@ -1279,7 +1322,7 @@
+                         swapchain_vk, context_vk, src_rect, dst_rect, swap_interval)))
+                     ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
+             }
+-            else
++            else if (vr != VK_TIMEOUT)
+             {
+                 ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
+             }
+@@ -1996,10 +2039,10 @@
+         }
+ 
+         if (!width)
+-            width = client_rect.right;
++            width = max(1, client_rect.right);
+ 
+         if (!height)
+-            height = client_rect.bottom;
++            height = max(1, client_rect.bottom);
+     }
+ 
+     if (width != desc->backbuffer_width || height != desc->backbuffer_height)
+--- /tmp/orig/dlls/wined3d/texture_vk.c	2026-07-10 20:08:06.497228500 +0900
++++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/wined3d/texture_vk.c	2026-05-16 15:45:06.031112270 +0900
+@@ -175,9 +175,19 @@
+     {
+         unsigned int staging_row_pitch, staging_slice_pitch, staging_size;
+ 
+-        wined3d_format_calculate_pitch(plane_format, context->device->surface_alignment, src_width, src_height,
+-                &staging_row_pitch, &staging_slice_pitch);
+-        staging_size = staging_slice_pitch * src_depth;
++        if (plane_format->upload)
++        {
++            staging_row_pitch = align(src_width * plane_format->conv_byte_count,
++                    context->device->surface_alignment);
++            staging_slice_pitch = staging_row_pitch * src_height;
++            staging_size = staging_slice_pitch * src_depth;
++        }
++        else
++        {
++            wined3d_format_calculate_pitch(plane_format, context->device->surface_alignment,
++                    src_width, src_height, &staging_row_pitch, &staging_slice_pitch);
++            staging_size = staging_slice_pitch * src_depth;
++        }
+ 
+         if (!wined3d_context_vk_create_bo(context_vk, staging_size,
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, &staging_bo))
+@@ -196,8 +206,20 @@
+             return;
+         }
+ 
+-        wined3d_format_copy_data(plane_format, src_bo_addr->addr + src_offset, src_row_pitch, src_slice_pitch,
+-                map_ptr, staging_row_pitch, staging_slice_pitch, src_width, src_height, src_depth);
++        if (plane_format->upload)
++        {
++            plane_format->upload(src_bo_addr->addr + src_offset, map_ptr,
++                    src_row_pitch, src_slice_pitch,
++                    staging_row_pitch, staging_slice_pitch,
++                    src_width, src_height, src_depth);
++        }
++        else
++        {
++            wined3d_format_copy_data(plane_format, src_bo_addr->addr + src_offset,
++                    src_row_pitch, src_slice_pitch,
++                    map_ptr, staging_row_pitch, staging_slice_pitch,
++                    src_width, src_height, src_depth);
++        }
+ 
+         range.offset = 0;
+         range.size = staging_size;
+@@ -245,11 +267,19 @@
+             dst_texture_vk->image.vk_image, &vk_range);
+ 
+     region.bufferOffset = src_bo->b.buffer_offset + src_offset;
+-    region.bufferRowLength = (src_row_pitch / plane_format->block_byte_count) * plane_format->block_width;
+-    if (src_row_pitch)
+-        region.bufferImageHeight = (src_slice_pitch / src_row_pitch) * plane_format->block_height;
++    if (plane_format->upload)
++    {
++        region.bufferRowLength = src_row_pitch / plane_format->conv_byte_count;
++        region.bufferImageHeight = src_slice_pitch / src_row_pitch;
++    }
+     else
+-        region.bufferImageHeight = 1;
++    {
++        region.bufferRowLength = (src_row_pitch / plane_format->block_byte_count) * plane_format->block_width;
++        if (src_row_pitch)
++            region.bufferImageHeight = (src_slice_pitch / src_row_pitch) * plane_format->block_height;
++        else
++            region.bufferImageHeight = 1;
++    }
+     region.imageSubresource.aspectMask = vk_range.aspectMask;
+     region.imageSubresource.mipLevel = vk_range.baseMipLevel;
+     region.imageSubresource.baseArrayLayer = vk_range.baseArrayLayer;
+--- /tmp/orig/dlls/wined3d/view.c	2026-07-10 20:08:06.934223594 +0900
++++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/wined3d/view.c	2026-05-16 17:43:48.740106654 +0900
+@@ -2028,7 +2028,7 @@
+ void wined3d_device_vk_uav_clear_state_init(struct wined3d_device_vk *device_vk)
+ {
+     struct wined3d_uav_clear_state_vk *state = &device_vk->uav_clear_state;
+-    struct wined3d_context_vk *context_vk = &device_vk->context_vk;
++    struct wined3d_context_vk *context_vk = device_vk->context_vk;
+     VkDescriptorSetLayoutBinding vk_set_bindings[2];
+ 
+     vk_set_bindings[0].binding = 0;
+--- /tmp/orig/dlls/wined3d/cs.c	2026-07-10 20:08:07.568216480 +0900
++++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/wined3d/cs.c	2026-07-05 14:11:31.278627149 +0900
+@@ -718,9 +718,6 @@
+     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
+ 
+     /* Discard buffers if the swap effect allows it. */
+-    back_buffer = swapchain->back_buffers[desc->backbuffer_count - 1];
+-    if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
+-        wined3d_texture_validate_location(back_buffer, 0, WINED3D_LOCATION_DISCARDED);
+ 
+     if (dsv && dsv->resource->type != WINED3D_RTYPE_BUFFER)
+     {
+@@ -789,22 +786,11 @@
+ 
+     wined3d_device_context_submit(&cs->c, WINED3D_CS_QUEUE_DEFAULT);
+ 
+-    /* Limit input latency by limiting the number of presents that we can get
+-     * ahead of the worker thread. */
+-    while (pending >= swapchain->max_frame_latency)
+-    {
+-        InterlockedExchange(&cs->waiting_for_present, TRUE);
+-
+-        pending = InterlockedCompareExchange(&cs->pending_presents, 0, 0);
+-        if (pending >= swapchain->max_frame_latency || !InterlockedCompareExchange(&cs->waiting_for_present, FALSE, TRUE))
+-        {
+-            TRACE_(d3d_perf)("Reached latency limit (%u frames), blocking to wait.\n", swapchain->max_frame_latency);
+-            wined3d_mutex_unlock();
+-            WaitForSingleObject(cs->present_event, INFINITE);
+-            wined3d_mutex_lock();
+-            TRACE_(d3d_perf)("Woken up from the wait.\n");
+-        }
+-    }
++    /* [AviUtl2] Bypass frame latency throttle to prevent UI freeze during playback.
++     * The throttle can block the main thread waiting for GPU completion inside
++     * the CS thread, which prevents message processing. With 0-timeout acquire
++     * the CS thread will never stall, so the throttle is unnecessary. */
++    while (0){} /* always false for now */
+ }
+ 
+ static void wined3d_cs_exec_clear(struct wined3d_cs *cs, const void *data)
+@@ -3394,6 +3380,19 @@
+ 
+         TRACE_(d3d_perf)("Waiting for free space. Head %lu, tail %lu, packet size %Iu.\n",
+                 head, tail, packet_size);
++
++        YieldProcessor();
++
++        /* [AviUtl2] Periodically pump input messages to keep UI alive */
++        {
++            MSG pump_msg;
++            PeekMessageW(&pump_msg, NULL, WM_KEYFIRST, WM_MOUSELAST, PM_REMOVE | PM_QS_INPUT);
++            if (pump_msg.message)
++            {
++                TranslateMessage(&pump_msg);
++                DispatchMessageW(&pump_msg);
++            }
++        }
+     }
+ 
+     packet = (struct wined3d_cs_packet *)&queue->data[head];
+@@ -3422,7 +3421,9 @@
+ 
+     TRACE_(d3d_perf)("Waiting for queue %u to be empty.\n", queue_id);
+     while (cs->queue[queue_id].head != *(volatile ULONG *)&cs->queue[queue_id].tail)
++    {
+         wined3d_pause(&spin_count);
++    }
+     TRACE_(d3d_perf)("Queue is now empty.\n");
+ }
+ 
+--- /tmp/orig/dlls/wined3d/wined3d_private.h	2026-07-10 20:08:08.183209581 +0900
++++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/wined3d/wined3d_private.h	2026-07-05 12:49:07.065923707 +0900
+@@ -474,6 +474,7 @@
+     unsigned int multisample_textures;
+     unsigned int sample_count;
+     unsigned int strict_shader_math;
++    unsigned int multiply_special;
+     unsigned int max_sm_vs;
+     unsigned int max_sm_hs;
+     unsigned int max_sm_ds;
+@@ -3900,6 +3901,17 @@
+             break;
+ 
+         wined3d_pause(&spin_count);
++
++        /* [AviUtl2] Periodically pump an input message while waiting */
++        {
++            MSG pump_msg;
++            if (PeekMessageW(&pump_msg, NULL, WM_KEYFIRST, WM_MOUSELAST,
++                    PM_REMOVE | PM_QS_INPUT))
++            {
++                TranslateMessage(&pump_msg);
++                DispatchMessageW(&pump_msg);
++            }
++        }
+     }
+ }
+ 

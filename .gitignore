@@ -1,0 +1,27 @@
+# Wine build artifacts
+*.o
+*.a
+*.so
+*.dll
+*.dll.so
+*.def
+*.res
+*.ok
+*.fake
+Makefile
+config.log
+config.status
+autom4te.cache/
+
+# Debug logs
+*.log
+/tmp/nv12_*.log
+
+# Project specific
+/wine/
+!/wine/dlls/wined3d/
+!/wine/dlls/d3d11/
+!/wine/dlls/dxgi/
+!/wine/dlls/user32/
+# Note: If the entire wine source is meant to be tracked, we can adjust this.
+# For now, tracking only the modified DLL directories.

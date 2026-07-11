@@ -1,0 +1,35 @@
+--- /tmp/message.c.orig	2026-07-10 20:00:13.475417111 +0900
++++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/user32/message.c	2026-07-05 17:33:43.426956696 +0900
+@@ -28,6 +28,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(msg);
+ 
++static LRESULT dispatch_message( const MSG *msg, BOOL ansi );
++
+ #define MAX_ATOM_LEN  255
+ 
+ /* pack a pointer into a 32/64 portable format */
+@@ -709,7 +711,22 @@
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH PeekMessageW( MSG *msg_out, HWND hwnd, UINT first, UINT last, UINT flags )
+ {
+-    return NtUserPeekMessage( msg_out, hwnd, first, last, flags );
++    BOOL ret = NtUserPeekMessage( msg_out, hwnd, first, last, flags );
++
++    if (ret && (flags & PM_REMOVE) && msg_out->message == WM_KEYDOWN && msg_out->wParam == VK_SPACE)
++    {
++        ERR("VK_SPACE PM_REMOVE tick=%lu\n", GetTickCount());
++        static ULONG_PTR last_lParam;
++        if (msg_out->lParam != last_lParam)
++        {
++            last_lParam = msg_out->lParam;
++            TranslateMessage( msg_out );
++            DispatchMessageW( msg_out );
++        }
++        msg_out->message = WM_NULL;
++    }
++
++    return ret;
+ }
+ 
+ 
