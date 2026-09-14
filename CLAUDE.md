@@ -5,8 +5,15 @@ AviUtl2 を Wine 上で動作させるための wined3d/d3d11 の修正プロジ
 ## 環境
 - GPU: AMD Radeon 840M (radeonsi, RDNA3.5)
 - Mesa: 25.2.8
-- wine-staging: 11.8
-- ソースコード: パッチ適用済みは `wine/` (wine 11.7 ベース)
+- wine-staging: 11.16 (`/opt/wine-staging`, 2026-09 更新)
+- ソースコード: `wine/` は旧 11.7 ベースで温存。新規の正は 11.16 worktree (`/tmp/opencode/wine-11.16`,
+  ブランチ `aviutl2-wine-11.16`。コミット自体は `wine/.git` に保存されるため worktree 消失時も
+  `git worktree` で復旧可)。`aviutl2_*.patch` は staging-11.16 適用済みツリーにクリーン適用確認済み。
+
+## 注意: `/usr/bin/wine` は別物 (2026-09-14)
+- `PATH` 上の `wine`/`winecfg` はディストロ標準の **Wine 10.0**。`winecfg` で見える `10.0` はこれ。
+- AviUtl2 の起動・`wineboot`・`winecfg` は必ずフルパス `/opt/wine-staging/bin/wine*` を使用すること。
+  10.0 の `winecfg` が `~/.wine` prefix をダウングレードした実績あり（`wineboot -u` で復旧）。
 
 ## 注意: ソースツリーの状態 (2026-06-06)
 
@@ -15,8 +22,26 @@ AviUtl2 を Wine 上で動作させるための wined3d/d3d11 の修正プロジ
 
 **結論**: `wine/` が唯一の正しいソース。
 
-## ビルド・デプロイ手順
-- **wined3d のビルド**:
+## ビルド・デプロイ手順 (11.16)
+- **ソース準備**: `/tmp/opencode/wine-11.16` (worktree, ブランチ `aviutl2-wine-11.16`)
+  = `wine-11.16` タグ + wine-staging v11.16 (`staging/patchinstall.py --all --backend=git-apply`,
+  最後の `autoreconf` は未インストールのため失敗するがパッチ適用自体は完了する) + `aviutl2_*.patch`
+- **configure**: `./configure --enable-win64` (11.7 ツリーの `config.status --config` と同条件)
+- **ビルド** (各モジュール):
+  ```
+  make -j$(nproc) dlls/wined3d/x86_64-windows/wined3d.dll dlls/d3d11/x86_64-windows/d3d11.dll \
+    dlls/comdlg32/x86_64-windows/comdlg32.dll dlls/shell32/x86_64-windows/shell32.dll \
+    dlls/dwrite/x86_64-windows/dwrite.dll programs/explorer/x86_64-windows/explorer.exe
+  ```
+- **prefix 更新→デプロイ** (順序厳守。prefix 更新が system32 を素に戻すため):
+  ```
+  /opt/wine-staging/bin/wineboot -u
+  cd ~/Program/Cpp/Wine_Aviutl2_Adapter && WINE_SOURCE=/tmp/opencode/wine-11.16 sudo ./deploy_dlls.sh
+  ```
+  (`deploy_dlls.sh` は `WINE_SOURCE` 環境変数でソース切替可、`SKIP_OPT=1` で prefix のみ更新可。
+  `/opt` と `~/.wine/.../system32` の両方に配置する。`dxgi` はパッチ対象外のためデプロイしない)
+- **旧 11.7 ツリーの手順** (`wine/` ディレクトリ): 以下は参考記録。新規ビルドは 11.16 worktree で行うこと。
+- **wined3d のビルド** (旧):
   ```
   cd ~/Wine_Aviutl2_Adapter/wine
   make -j$(nproc) dlls/wined3d/x86_64-windows/wined3d.dll
@@ -214,8 +239,9 @@ AviUtl2 で動画再生中に Space キー（またはマウスクリック）�
 ### 対応不要の修正
 | ファイル | 変更 | 状態 |
 |---------|------|:--:|
-| `dlls/user32/dialog.c` | IsDialogMessageW VK_SPACE ハンドラ | ❌ revert 済み |
-| `dlls/user32/defdlg.c` | DefDlgProcW VK_SPACE ハンドラ | ❌ revert 済み |
+| `dlls/user32/dialog.c` | IsDialogMessageW VK_SPACE ハンドラ | ⚠️ revert 記録と矛盾・コードはツリーに残存 (2026-09-14 確認)。無害だが未整理 |
+| `dlls/user32/defdlg.c` | DefDlgProcW VK_SPACE ハンドラ | ⚠️ 同上 |
+| `dlls/user32/message.c` | PeekMessageW 改造 | ✅ ツリーから除去済み。`aviutl2_user32.patch` からも除外 |
 
 ### 現在適用中の修正
 | ファイル | 変更 | 状態 |
@@ -287,6 +313,29 @@ AviUtl2 で動画再生中に Space キー（またはマウスクリック）�
 - user32.dll レベルの介入は再生中に到達しないため根本的に無効
 
 **現在のアプローチ（2026-07-23）**: `wined3d_swapchain_present` の mutex unlock 後に再入ガード付きで DispatchMessageW。毎フレーム到達し、mutex 解放済み。再入ガード (`static BOOL in_pump`) により Present の再帰呼び出しを安全にスキップ。
+
+## 11.16 への移植 (2026-09-14 ✅ 起動確認済み)
+
+`/opt/wine-staging` が 11.16 に更新され、配備済み DLL が素に戻ったため全パッチを移植・再ビルド。
+起動確認: `timeout 45 /opt/wine-staging/bin/wine .../aviutl2.exe` で 45 秒間安定動作、
+Vulkan レンダラーで UI 描画 (d2d) まで到達。import エラー・page fault なし。
+
+### 11.7→11.16 の上流変化に伴う手動ポート (パッチファイルに反映済み)
+| ファイル | 内容 |
+|---------|------|
+| `dlls/wined3d/decoder.c` | `&device_vk->context_vk` → `device_vk->context_vk` (上流で関数分割 `create_layered_image` へ移動) |
+| `dlls/wined3d/swapchain.c` | 旧 `pending_presents` スロットルが `frame_latency_semaphore` 方式に置換 → `if (0 && ...)` でバイパス |
+| `dlls/win32u/vulkan.c` | SUBOPTIMAL 抑制を `AcquireNextImage2`/`QueuePresent` に移植 (32bit client/host 分離後の新コードに対応。旧ツリー同様、非-2 系は対象外) |
+| `dlls/wined3d/utils.c` | `plane_formats` が構造体ポインタ配列化 → `get_format_internal()` 代入に修正 (ビルドエラー対応) |
+
+### 移植時のミスと対策
+- パッチ再生成時に `git add -N` を `git reset` で消したまま再生成 → 新規ファイル
+  (`winefiledialog/` `wineopenfolder/`) がパッチから脱落。`--check` は通るため気づきにくい。
+  **対策**: 再生成後は `grep "^+++ "` で新規ファイルの存在を必ず目視確認する。
+- `deploy_dlls.sh` を `WINE_SOURCE` 未指定で実行 → 旧 11.7 DLL を誤デプロイ。
+  **対策**: md5 で `/opt` とビルド物の一致を必ず確認する (手順に明記)。
+- `sudo` が container 制限 (NoNewPrivs) で一時不通 → `SKIP_OPT=1` で prefix 側のみ先行デプロイ。
+  後に制限解消を確認しフルデプロイした。
 
 
 
