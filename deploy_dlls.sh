@@ -65,7 +65,7 @@ install_dll() {
     echo "deployed $name.dll"
 }
 
-for pair in "wined3d:wined3d" "d3d11:d3d11" "comdlg32:comdlg32" "shell32:shell32" "dwrite:dwrite"; do
+for pair in "wined3d:wined3d" "d3d11:d3d11" "comdlg32:comdlg32" "shell32:shell32" "dwrite:dwrite" "user32:user32" "win32u:win32u"; do
     install_dll "${pair%%:*}" "${pair##*:}"
 done
 
