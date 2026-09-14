@@ -190,10 +190,8 @@ WINE_NATIVE_FILE_DIALOG=0 /opt/wine-staging/bin/wine /home/p-yoko/App/Aviutl2/av
 ### 症状
 AviUtl2 で動画再生中に Space キー（またはマウスクリック）で停止できない。非再生中は Space・ボタン共に正常動作する。「再生中の操作が一気に実行される」現象あり。
 
-### 判明している根本原因
-トレースにより、動画再生中 AviUtl2 のメインスレッドが `PeekMessageW(PM_REMOVE)` でメッセージをキューから取得するが **`DispatchMessageW` を呼ばない** ことが判明。再生終了後に溜まったメッセージが一括 dispatch される。
-
-「再生中の操作が一気に実行される」挙動から、再生ループ中は PeekMessage を呼ばずメッセージがキューに溜まり続け、再生終了後の通常ループで一括処理されると推測。
+### 確定した根本原因（2026-07-23）
+動画再生中 AviUtl2 のメインスレッドは **`PeekMessageW` を全く呼ばない**（GetTickCount ログで確認済み）。メッセージはキューに溜まり続け、再生終了後の通常ループで一括取得される。
 
 ### 試行済みのアプローチ（すべて失敗または不安定）
 
@@ -222,9 +220,7 @@ AviUtl2 で動画再生中に Space キー（またはマウスクリック）�
 ### 現在適用中の修正
 | ファイル | 変更 | 状態 |
 |---------|------|:--:|
-| `dlls/wined3d/cs.c` | `wined3d_cs_queue_require_space` スピンに 1メッセージ入力ポンプ | ⚠️ 効果未確認・安定 |
-| `dlls/wined3d/cs.c` | `wined3d_cs_mt_finish` に 1メッセージ入力ポンプ | ⚠️ 効果未確認・安定 |
-| `dlls/wined3d/wined3d_private.h` | `wined3d_resource_wait_idle` に 1メッセージ入力ポンプ | ⚠️ 効果未確認・安定 |
+| `dlls/wined3d/swapchain.c` | `wined3d_mutex_unlock` 後に再入ガード付き 1メッセージポンプ | ⚠️ 効果未確認・安定 |
 | `dlls/wined3d/cs.c` | Present フレームレイテンシスロットルバイパス (`while(0){}`) | ✅ 安定 |
 | `dlls/d3d11/device.c` | SwapDeviceContextState 高速パス、NULL view チェック、ERR→WARN | ✅ 安定 |
 
@@ -247,11 +243,11 @@ AviUtl2 で動画再生中に Space キー（またはマウスクリック）�
 **重要**: Space キーは `0128`（メインスレッド）のキューに積まれる。
 `0128` の `wined3d_cs_mt_finish` スピン中にポンプすれば取れるが、D3D コールスタック上なので `DispatchMessageW` が WndProc → D3D Present の再入を起こしクラッシュ。
 
-### 試行済み：swapchain_present 後のポンプ（2026-07-05 ❌ クラッシュ）
-`wined3d_swapchain_present` の mutex unlock 直後で `while(PeekMessageW + DispatchMessageW)` → AviUtl2 WndProc が Space を受けて停止処理 → 再度 D3D Present 呼び出し → `wined3d_swapchain_present` 再入でクラッシュ。
+### ❌ クラッシュ：swapchain_present 後の while ポンプ（2026-07-05）
+`wined3d_swapchain_present` の mutex unlock 直後で `while(PeekMessageW + DispatchMessageW)` → AviUtl2 WndProc が Space を受けて停止処理 → 再度 D3D Present → 再入でクラッシュ。その後 revert。
 
-### ❌ revert 済み：swapchain_present ポンプ（2026-07-05）
-wined3d_cs_mt_finish の DispatchMessageW を PostMessageW に変更 → revert 済み。swapchain.c のポンプも revert 済み。
+### 🔄 再実装：再入ガード付き swapchain_present ポンプ（2026-07-23）
+`static BOOL in_pump` ガードを追加。再入時はスキップされるためクラッシュしない設計。`while` → `if` に変更し1メッセージのみ処理。cs.c の無効ポンプは除去。
 
 ### ❌ 無効確認済み：PeekMessageW 改造（2026-07-10）
 `PeekMessageW` 内: PM_REMOVE で VK_SPACE WM_KEYDOWN 取得時、`PostMessageW(msg.hwnd, ...)` で再投入し `msg_out->message = WM_NULL` に置換。
@@ -290,12 +286,7 @@ wined3d_cs_mt_finish の DispatchMessageW を PostMessageW に変更 → revert 
 - `DispatchMessageW` で WndProc に直接 VK_SPACE を送っても、AviUtl2 は再生中はそれを無視する
 - user32.dll レベルの介入は再生中に到達しないため根本的に無効
 
-**残るアプローチ**: wined3d の毎フレーム到達箇所（`wined3d_swapchain_present` 等）からの介入。ただし D3D コールスタック上での `DispatchMessageW` は再入クラッシュが避けられない。
-
-### 今後の調査方針
-1. **user32 PeekMessageW 改造**: AviUtl2 が `PeekMessage(PM_REMOVE)` で VK_SPACE を取り出す際、dispatch して WM_NULL で返す（wined3d 不要、user32.dll レベルで対応）
-2. **AviUtl2 の WH_KEYBOARD_LL 確認**: AviUtl2 が自身で低レベルキーフックを登録しているか確認。Wine の WH_KEYBOARD_LL 実装が不完全な可能性
-3. **xdotool 外部クリック**: X11 レベルでボタンクリックを送信
+**現在のアプローチ（2026-07-23）**: `wined3d_swapchain_present` の mutex unlock 後に再入ガード付きで DispatchMessageW。毎フレーム到達し、mutex 解放済み。再入ガード (`static BOOL in_pump`) により Present の再帰呼び出しを安全にスキップ。
 
 
 
