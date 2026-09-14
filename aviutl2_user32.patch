@@ -1,5 +1,5 @@
 diff --git a/dlls/user32/defdlg.c b/dlls/user32/defdlg.c
-index 07113d8754d..c9e557a4f46 100644
+index 87b3c37fe09..ec61543bee3 100644
 --- a/dlls/user32/defdlg.c
 +++ b/dlls/user32/defdlg.c
 @@ -208,9 +208,20 @@ static HWND root_dialog(HWND hwnd)
@@ -27,7 +27,7 @@ index 07113d8754d..c9e557a4f46 100644
              HBRUSH brush = (HBRUSH)SendMessageW( hwnd, WM_CTLCOLORDLG, wParam, (LPARAM)hwnd );
              if (!brush) brush = (HBRUSH)DefWindowProcW( hwnd, WM_CTLCOLORDLG, wParam, (LPARAM)hwnd );
 diff --git a/dlls/user32/dialog.c b/dlls/user32/dialog.c
-index 46a12cef1a9..6f5be4ffab5 100644
+index 7580ba4f958..6f589cfacc3 100644
 --- a/dlls/user32/dialog.c
 +++ b/dlls/user32/dialog.c
 @@ -1241,6 +1241,19 @@ BOOL WINAPI IsDialogMessageW( HWND hwndDlg, LPMSG msg )
@@ -50,7 +50,3 @@ index 46a12cef1a9..6f5be4ffab5 100644
          case VK_CANCEL:
          case VK_ESCAPE:
              SendMessageW( hwndDlg, WM_COMMAND, IDCANCEL, (LPARAM)GetDlgItem( hwndDlg, IDCANCEL ) );
-diff --git a/dlls/user32/x86_64-windows/libuser32.delay.a b/dlls/user32/x86_64-windows/libuser32.delay.a
-deleted file mode 100644
-index 2926c6820c2..00000000000
-Binary files a/dlls/user32/x86_64-windows/libuser32.delay.a and /dev/null differ

@@ -17,7 +17,7 @@
 # Prefix update rewrites system32, so deploying BEFORE it would be lost.
 set -euo pipefail
 
-WINE_SOURCE="/home/p-yoko/Program/Cpp/Wine_Aviutl2_Adapter/wine"
+WINE_SOURCE="${WINE_SOURCE:-/home/p-yoko/Program/Cpp/Wine_Aviutl2_Adapter/wine}"
 WINE_BIN="/opt/wine-staging/bin/wine"
 OPT_DIR="/opt/wine-staging/lib/wine/x86_64-windows"
 PREFIX_DIR="$HOME/.wine/drive_c/windows/system32"
@@ -30,7 +30,19 @@ DLL_DIRS="wined3d d3d11 comdlg32 shell32 dwrite"
 [ -d "$WINE_SOURCE" ] || { echo "ERROR: $WINE_SOURCE not found" >&2; exit 1; }
 [ -d "$PREFIX_DIR" ] || { echo "ERROR: prefix dir $PREFIX_DIR not found" >&2; exit 1; }
 
-# Back up the currently installed file once (versioned, never overwrite old backups)
+# Set SKIP_OPT=1 to update only the prefix (system32 + helpers), e.g. when
+# sudo is unavailable. /opt copies must then be done separately.
+SKIP_OPT="${SKIP_OPT:-0}"
+
+opt_cp() {
+    if [ "$SKIP_OPT" = 1 ]; then return 0; fi
+    sudo cp "$@"
+}
+
+opt_backup_once() {
+    if [ "$SKIP_OPT" = 1 ]; then return 0; fi
+    backup_once "$1" sudo
+}
 backup_once() {
     local dest="$1" use_sudo="$2"
     local ver
@@ -46,8 +58,8 @@ install_dll() {
     local name="$1" srcdir="$2"
     local src="$WINE_SOURCE/dlls/$srcdir/x86_64-windows/$name.dll"
     [ -f "$src" ] || { echo "ERROR: built $src not found. Build it first." >&2; exit 1; }
-    backup_once "$OPT_DIR/$name.dll" sudo
-    sudo cp "$src" "$OPT_DIR/"
+    opt_backup_once "$OPT_DIR/$name.dll"
+    opt_cp "$src" "$OPT_DIR/"
     backup_once "$PREFIX_DIR/$name.dll" nosudo
     cp "$src" "$PREFIX_DIR/"
     echo "deployed $name.dll"
@@ -60,8 +72,8 @@ done
 # explorer.exe (patched: /select -> native file manager)
 EXPLORER_SRC="$WINE_SOURCE/programs/explorer/x86_64-windows/explorer.exe"
 if [ -f "$EXPLORER_SRC" ]; then
-    backup_once "$OPT_DIR/explorer.exe" sudo
-    sudo cp "$EXPLORER_SRC" "$OPT_DIR/"
+    opt_backup_once "$OPT_DIR/explorer.exe"
+    opt_cp "$EXPLORER_SRC" "$OPT_DIR/"
     backup_once "$PREFIX_DIR/explorer.exe" nosudo
     cp "$EXPLORER_SRC" "$PREFIX_DIR/"
     echo "deployed explorer.exe"
