@@ -1,35 +1,56 @@
---- /tmp/message.c.orig	2026-07-10 20:00:13.475417111 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/user32/message.c	2026-07-05 17:33:43.426956696 +0900
-@@ -28,6 +28,8 @@
- 
- WINE_DEFAULT_DEBUG_CHANNEL(msg);
- 
-+static LRESULT dispatch_message( const MSG *msg, BOOL ansi );
-+
- #define MAX_ATOM_LEN  255
- 
- /* pack a pointer into a 32/64 portable format */
-@@ -709,7 +711,22 @@
-  */
- BOOL WINAPI DECLSPEC_HOTPATCH PeekMessageW( MSG *msg_out, HWND hwnd, UINT first, UINT last, UINT flags )
+diff --git a/dlls/user32/defdlg.c b/dlls/user32/defdlg.c
+index 07113d8754d..c9e557a4f46 100644
+--- a/dlls/user32/defdlg.c
++++ b/dlls/user32/defdlg.c
+@@ -208,9 +208,20 @@ static HWND root_dialog(HWND hwnd)
+ static LRESULT DEFDLG_Proc( HWND hwnd, UINT msg, WPARAM wParam,
+                             LPARAM lParam, DIALOGINFO *dlgInfo )
  {
--    return NtUserPeekMessage( msg_out, hwnd, first, last, flags );
-+    BOOL ret = NtUserPeekMessage( msg_out, hwnd, first, last, flags );
-+
-+    if (ret && (flags & PM_REMOVE) && msg_out->message == WM_KEYDOWN && msg_out->wParam == VK_SPACE)
-+    {
-+        ERR("VK_SPACE PM_REMOVE tick=%lu\n", GetTickCount());
-+        static ULONG_PTR last_lParam;
-+        if (msg_out->lParam != last_lParam)
-+        {
-+            last_lParam = msg_out->lParam;
-+            TranslateMessage( msg_out );
-+            DispatchMessageW( msg_out );
-+        }
-+        msg_out->message = WM_NULL;
-+    }
-+
-+    return ret;
- }
+-    switch(msg)
+-    {
+-        case WM_ERASEBKGND:
++switch(msg)
++            {
++            case WM_KEYDOWN:
++                if (wParam == VK_SPACE)
++                {
++                    HWND hwndFocus = GetFocus();
++                    if (hwndFocus && IsChild( hwnd, hwndFocus ))
++                        SendMessageW( hwnd, WM_COMMAND,
++                                MAKEWPARAM( GetDlgCtrlID( hwndFocus ), BN_CLICKED ),
++                                (LPARAM)hwndFocus );
++                    return 0;
++                }
++                return DefWindowProcW( hwnd, msg, wParam, lParam );
++            case WM_ERASEBKGND:
+         {
+             HBRUSH brush = (HBRUSH)SendMessageW( hwnd, WM_CTLCOLORDLG, wParam, (LPARAM)hwnd );
+             if (!brush) brush = (HBRUSH)DefWindowProcW( hwnd, WM_CTLCOLORDLG, wParam, (LPARAM)hwnd );
+diff --git a/dlls/user32/dialog.c b/dlls/user32/dialog.c
+index 46a12cef1a9..6f5be4ffab5 100644
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -1241,6 +1241,19 @@ BOOL WINAPI IsDialogMessageW( HWND hwndDlg, LPMSG msg )
+             }
+             break;
  
- 
++        case VK_SPACE:
++            {
++                HWND hwndFocus = GetFocus();
++                if (IsChild( hwndDlg, hwndFocus ))
++                {
++                    SendMessageW( hwndDlg, WM_COMMAND,
++                            MAKEWPARAM( GetDlgCtrlID( hwndFocus ), BN_CLICKED ),
++                            (LPARAM)hwndFocus );
++                    return TRUE;
++                }
++            }
++            break;
++
+         case VK_CANCEL:
+         case VK_ESCAPE:
+             SendMessageW( hwndDlg, WM_COMMAND, IDCANCEL, (LPARAM)GetDlgItem( hwndDlg, IDCANCEL ) );
+diff --git a/dlls/user32/x86_64-windows/libuser32.delay.a b/dlls/user32/x86_64-windows/libuser32.delay.a
+deleted file mode 100644
+index 2926c6820c2..00000000000
+Binary files a/dlls/user32/x86_64-windows/libuser32.delay.a and /dev/null differ

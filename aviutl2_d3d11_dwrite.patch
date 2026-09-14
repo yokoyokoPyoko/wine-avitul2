@@ -1,6 +1,408 @@
---- /tmp/orig/dlls/d3d11/device.c	2026-07-10 20:08:01.547284136 +0900
-+++ dlls/d3d11/device.c	2026-06-09 21:21:35.772554121 +0900
-@@ -2939,10 +2939,20 @@
+diff --git a/dlls/comdlg32/filedlg.c b/dlls/comdlg32/filedlg.c
+index c0d3aec60b0..e0a27e03b8c 100644
+--- a/dlls/comdlg32/filedlg.c
++++ b/dlls/comdlg32/filedlg.c
+@@ -4164,9 +4164,149 @@ BOOL WINAPI GetOpenFileNameA(OPENFILENAMEA *ofn)
+  *    FALSE on cancel, error, close or filename-does-not-fit-in-buffer.
+  *
+  */
++/* Try native file dialog (zenity) for GetOpenFileNameW/GetSaveFileNameW.
++ * Returns TRUE on success, FALSE on cancel/error, -1 to fall back to built-in dialog. */
++static int try_native_getopenfilename(OPENFILENAMEW *ofn, BOOL is_save)
++{
++    static BOOL checked = FALSE;
++    static BOOL use_native = FALSE;
++    WCHAR cmdline[4096], exe_path[MAX_PATH], temp_path[MAX_PATH], result_path[MAX_PATH];
++    PROCESS_INFORMATION pi;
++    STARTUPINFOW si;
++    DWORD exit_code, read_len;
++    HANDLE hFile;
++    char buf[4096];
++    WCHAR resultW[MAX_PATH];
++    int result_len;
++    UINT i;
++
++    if (!checked)
++    {
++        const char *env = getenv("WINE_NATIVE_FILE_DIALOG");
++        if (env && (!strcmp(env, "0") || !strcmp(env, "false")))
++            use_native = FALSE;
++        else
++            use_native = TRUE;
++        checked = TRUE;
++    }
++    if (!use_native) return -1;
++
++    FIXME("Using native file dialog\n");
++
++    /* Build command line */
++    GetSystemDirectoryW(exe_path, MAX_PATH);
++    lstrcatW(exe_path, L"\\winefiledialog.exe");
++
++    lstrcpyW(cmdline, L"\"");
++    lstrcatW(cmdline, exe_path);
++    lstrcatW(cmdline, L"\"");
++
++    if (is_save)
++        lstrcatW(cmdline, L" --save");
++    else
++        lstrcatW(cmdline, L" --open");
++
++    if (ofn->lpstrTitle && ofn->lpstrTitle[0])
++    {
++        lstrcatW(cmdline, L" --title \"");
++        lstrcatW(cmdline, ofn->lpstrTitle);
++        lstrcatW(cmdline, L"\"");
++    }
++
++    /* Initial dir: prefer lpstrInitialDir, else directory part of lpstrFile */
++    if (ofn->lpstrInitialDir && ofn->lpstrInitialDir[0])
++    {
++        lstrcatW(cmdline, L" --filename \"");
++        lstrcatW(cmdline, ofn->lpstrInitialDir);
++        lstrcatW(cmdline, L"\"");
++    }
++
++    /* Convert lpstrFilter (double-null pairs) to --file-filter args */
++    if (ofn->lpstrFilter)
++    {
++        const WCHAR *fp = ofn->lpstrFilter;
++        while (*fp)
++        {
++            const WCHAR *name = fp;
++            while (*fp) fp++;
++            fp++;
++            const WCHAR *spec = fp;
++            while (*fp) fp++;
++            fp++;
++
++            /* Build: --file-filter "name|spec" */
++            lstrcatW(cmdline, L" --file-filter \"");
++            lstrcatW(cmdline, name);
++            lstrcatW(cmdline, L"|");
++            lstrcatW(cmdline, spec);
++            lstrcatW(cmdline, L"\"");
++        }
++    }
++
++    TRACE("Launching: %s\n", wine_dbgstr_w(cmdline));
++
++    /* Result file path */
++    GetTempPathW(MAX_PATH, temp_path);
++    lstrcpyW(result_path, temp_path);
++    lstrcatW(result_path, L"winefiledialog_result.txt");
++    DeleteFileW(result_path);
++
++    /* Launch */
++    memset(&si, 0, sizeof(si));
++    si.cb = sizeof(si);
++    if (!CreateProcessW(exe_path, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
++    {
++        ERR("Failed to launch winefiledialog.exe, error=%u\n", (unsigned)GetLastError());
++        return -1;
++    }
++    CloseHandle(pi.hThread);
++    WaitForSingleObject(pi.hProcess, 30000);
++    GetExitCodeProcess(pi.hProcess, &exit_code);
++    CloseHandle(pi.hProcess);
++
++    /* Read result */
++    hFile = CreateFileW(result_path, GENERIC_READ, FILE_SHARE_READ, NULL,
++                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (hFile == INVALID_HANDLE_VALUE)
++        return FALSE;
++
++    ReadFile(hFile, buf, sizeof(buf) - 1, &read_len, NULL);
++    buf[read_len] = '\0';
++    CloseHandle(hFile);
++    DeleteFileW(result_path);
++
++    /* Trim trailing newline */
++    while (read_len > 0 && (buf[read_len-1] == '\n' || buf[read_len-1] == '\r'))
++        buf[--read_len] = '\0';
++    if (read_len == 0) return FALSE;
++
++    /* Convert to wide char */
++    result_len = MultiByteToWideChar(CP_UTF8, 0, buf, read_len + 1, resultW, MAX_PATH);
++    if (result_len <= 0 || result_len > ofn->nMaxFile)
++    {
++        COMDLG32_SetCommDlgExtendedError(FNERR_BUFFERTOOSMALL);
++        return FALSE;
++    }
++
++    /* Copy result to lpstrFile */
++    lstrcpyW(ofn->lpstrFile, resultW);
++
++    /* Set nFileOffset: find last backslash */
++    for (i = 0; resultW[i]; i++)
++        if (resultW[i] == '\\') ofn->nFileOffset = i + 1;
++    if (ofn->nFileOffset == 0) ofn->nFileOffset = 0;
++
++    /* Set nFileExtension: find last dot after offset */
++    ofn->nFileExtension = 0;
++    for (i = ofn->nFileOffset; resultW[i]; i++)
++        if (resultW[i] == '.') ofn->nFileExtension = i;
++
++    return TRUE;
++}
++
+ BOOL WINAPI GetOpenFileNameW(OPENFILENAMEW *ofn)
+ {
+-    TRACE("flags 0x%08lx\n", ofn->Flags);
++    FIXME("[v12.7-STAGING] GetOpenFileNameW called, flags 0x%08lx\n", ofn->Flags);
+ 
+     if (!valid_struct_size( ofn->lStructSize ))
+     {
+@@ -4174,6 +4314,12 @@ BOOL WINAPI GetOpenFileNameW(OPENFILENAMEW *ofn)
+         return FALSE;
+     }
+ 
++    /* Try native dialog */
++    {
++        int ret = try_native_getopenfilename(ofn, FALSE);
++        if (ret != -1) return ret;
++    }
++
+     /* OFN_FILEMUSTEXIST implies OFN_PATHMUSTEXIST */
+     if (ofn->Flags & OFN_FILEMUSTEXIST)
+         ofn->Flags |= OFN_PATHMUSTEXIST;
+diff --git a/dlls/comdlg32/itemdlg.c b/dlls/comdlg32/itemdlg.c
+index c12ae22e1c7..8ec985dcfc8 100644
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
+ #define COBJMACROS
+ #include "windef.h"
+@@ -32,6 +33,8 @@
+ #include "cdlg.h"
+ #include "filedlgbrowser.h"
+ 
++#include "shobjidl.h"
++
+ #include "wine/debug.h"
+ #include "wine/list.h"
+ 
+@@ -2519,13 +2522,180 @@ static ULONG WINAPI IFileDialog2_fnRelease(IFileDialog2 *iface)
+     return ref;
+ }
+ 
++/* Try native file dialog (zenity) via winefiledialog.exe helper.
++ * Returns S_OK on success, S_FALSE to fall back, or an error code. */
++static HRESULT try_native_file_dialog(FileDialogImpl *This)
++{
++    static BOOL checked = FALSE;
++    static BOOL use_native = FALSE;
++    WCHAR cmdline[4096], exe_path[MAX_PATH], temp_path[MAX_PATH], result_path[MAX_PATH];
++    PROCESS_INFORMATION pi;
++    STARTUPINFOW si;
++    DWORD exit_code;
++    HANDLE hFile;
++    char buf[4096];
++    DWORD read_len;
++    WCHAR pathW[MAX_PATH];
++    IShellItem *psi;
++    IShellItemArray *psia;
++    HRESULT hr;
++    UINT i;
++
++    if (!checked)
++    {
++        const char *env = getenv("WINE_NATIVE_FILE_DIALOG");
++        if (env && (!strcmp(env, "0") || !strcmp(env, "false")))
++            use_native = FALSE;
++        else
++            use_native = TRUE;
++        checked = TRUE;
++    }
++    if (!use_native) return S_FALSE;
++
++    FIXME("Using native file dialog via winefiledialog.exe\n");
++
++    /* Build command line */
++    GetSystemDirectoryW(exe_path, MAX_PATH);
++    lstrcatW(exe_path, L"\\winefiledialog.exe");
++
++    lstrcpyW(cmdline, L"\"");
++    lstrcatW(cmdline, exe_path);
++    lstrcatW(cmdline, L"\" --open");
++    if (This->dlg_type == ITEMDLG_TYPE_SAVE)
++        lstrcatW(cmdline, L" --save");
++    if (This->options & FOS_PICKFOLDERS)
++        lstrcatW(cmdline, L" --folder");
++    if (This->options & FOS_ALLOWMULTISELECT)
++        lstrcatW(cmdline, L" --multi");
++    if (This->custom_title && This->custom_title[0])
++    {
++        lstrcatW(cmdline, L" --title \"");
++        lstrcatW(cmdline, This->custom_title);
++        lstrcatW(cmdline, L"\"");
++    }
++    if (This->set_filename && This->set_filename[0])
++    {
++        lstrcatW(cmdline, L" --filename \"");
++        lstrcatW(cmdline, This->set_filename);
++        lstrcatW(cmdline, L"\"");
++    }
++    for (i = 0; i < This->filterspec_count; i++)
++    {
++        lstrcatW(cmdline, L" --file-filter \"");
++        lstrcatW(cmdline, This->filterspecs[i].pszName);
++        lstrcatW(cmdline, L"|");
++        lstrcatW(cmdline, This->filterspecs[i].pszSpec);
++        lstrcatW(cmdline, L"\"");
++    }
++
++    TRACE("Launching: %s\n", wine_dbgstr_w(cmdline));
++
++    /* Create result file path */
++    GetTempPathW(MAX_PATH, temp_path);
++    lstrcpyW(result_path, temp_path);
++    lstrcatW(result_path, L"winefiledialog_result.txt");
++    /* Delete previous result file if any */
++    DeleteFileW(result_path);
++
++    /* Launch winefiledialog.exe */
++    memset(&si, 0, sizeof(si));
++    si.cb = sizeof(si);
++    if (!CreateProcessW(exe_path, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
++    {
++        WARN("Failed to launch winefiledialog.exe (error %lu)\n", GetLastError());
++        return S_FALSE;
++    }
++
++    WaitForSingleObject(pi.hProcess, INFINITE);
++    GetExitCodeProcess(pi.hProcess, &exit_code);
++    CloseHandle(pi.hThread);
++    CloseHandle(pi.hProcess);
++
++    if (exit_code != 0)
++    {
++        TRACE("winefiledialog.exe cancelled (exit %lu)\n", exit_code);
++        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    }
++
++    /* Read result file */
++    hFile = CreateFileW(result_path, GENERIC_READ, FILE_SHARE_READ, NULL,
++                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (hFile == INVALID_HANDLE_VALUE)
++    {
++        WARN("Failed to open result file (error %lu)\n", GetLastError());
++        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    }
++
++    if (!ReadFile(hFile, buf, sizeof(buf) - 1, &read_len, NULL) || read_len == 0)
++    {
++        CloseHandle(hFile);
++        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    }
++    CloseHandle(hFile);
++    buf[read_len] = '\0';
++
++    /* Strip trailing newline */
++    while (read_len > 0 && (buf[read_len - 1] == '\n' || buf[read_len - 1] == '\r'))
++        buf[--read_len] = '\0';
++
++    if (read_len == 0)
++    {
++        TRACE("Empty result (cancelled)\n");
++        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    }
++
++    TRACE("Selected path: %s\n", wine_dbgstr_a(buf));
++
++    /* Convert UTF-8 result to WCHAR */
++    if (!MultiByteToWideChar(CP_UTF8, 0, buf, -1, pathW, ARRAY_SIZE(pathW)))
++    {
++        ERR("Failed to convert result to wide chars\n");
++        return E_FAIL;
++    }
++
++    /* Create IShellItem from path */
++    hr = SHCreateItemFromParsingName(pathW, NULL, &IID_IShellItem, (void**)&psi);
++    if (FAILED(hr))
++    {
++        ERR("SHCreateItemFromParsingName failed: %08lx\n", hr);
++        return E_FAIL;
++    }
++
++    /* Wrap in IShellItemArray */
++    hr = SHCreateShellItemArrayFromShellItem(psi, &IID_IShellItemArray, (void**)&psia);
++    IShellItem_Release(psi);
++    if (FAILED(hr))
++    {
++        ERR("SHCreateShellItemArrayFromShellItem failed: %08lx\n", hr);
++        return E_FAIL;
++    }
++
++    /* Store result */
++    This->psia_results = psia;
++
++    /* Notify FileOk event */
++    if (FAILED(hr = events_OnFileOk(This)))
++    {
++        IShellItemArray_Release(This->psia_results);
++        This->psia_results = NULL;
++        return hr;
++    }
++
++    return S_OK;
++}
++
+ static HRESULT WINAPI IFileDialog2_fnShow(IFileDialog2 *iface, HWND hwndOwner)
+ {
+     FileDialogImpl *This = impl_from_IFileDialog2(iface);
++    HRESULT hr;
+     TRACE("%p (%p)\n", iface, hwndOwner);
+ 
+     This->opendropdown_has_selection = FALSE;
+ 
++    hr = try_native_file_dialog(This);
++    if (hr != S_FALSE)
++        return hr;
++
+     return create_dialog(This, hwndOwner);
+ }
+ 
+diff --git a/dlls/comdlg32/x86_64-windows/cdlg32.o b/dlls/comdlg32/x86_64-windows/cdlg32.o
+index a46c8098134..43db8324f05 100644
+Binary files a/dlls/comdlg32/x86_64-windows/cdlg32.o and b/dlls/comdlg32/x86_64-windows/cdlg32.o differ
+diff --git a/dlls/comdlg32/x86_64-windows/colordlg.o b/dlls/comdlg32/x86_64-windows/colordlg.o
+index a07715d6e4c..be2a40af78b 100644
+Binary files a/dlls/comdlg32/x86_64-windows/colordlg.o and b/dlls/comdlg32/x86_64-windows/colordlg.o differ
+diff --git a/dlls/comdlg32/x86_64-windows/comdlg32.dll b/dlls/comdlg32/x86_64-windows/comdlg32.dll
+index e53bfc2b46c..21e0579c460 100644
+Binary files a/dlls/comdlg32/x86_64-windows/comdlg32.dll and b/dlls/comdlg32/x86_64-windows/comdlg32.dll differ
+diff --git a/dlls/comdlg32/x86_64-windows/filedlg.o b/dlls/comdlg32/x86_64-windows/filedlg.o
+index d9d8fdff67e..9f8f6b8e216 100644
+Binary files a/dlls/comdlg32/x86_64-windows/filedlg.o and b/dlls/comdlg32/x86_64-windows/filedlg.o differ
+diff --git a/dlls/comdlg32/x86_64-windows/filedlg31.o b/dlls/comdlg32/x86_64-windows/filedlg31.o
+index 1152d80d1fd..6f2f9cc7625 100644
+Binary files a/dlls/comdlg32/x86_64-windows/filedlg31.o and b/dlls/comdlg32/x86_64-windows/filedlg31.o differ
+diff --git a/dlls/comdlg32/x86_64-windows/filedlgbrowser.o b/dlls/comdlg32/x86_64-windows/filedlgbrowser.o
+index b1f180ecafd..72b9fb6baba 100644
+Binary files a/dlls/comdlg32/x86_64-windows/filedlgbrowser.o and b/dlls/comdlg32/x86_64-windows/filedlgbrowser.o differ
+diff --git a/dlls/comdlg32/x86_64-windows/finddlg.o b/dlls/comdlg32/x86_64-windows/finddlg.o
+index cee22ff71f0..373b16dc006 100644
+Binary files a/dlls/comdlg32/x86_64-windows/finddlg.o and b/dlls/comdlg32/x86_64-windows/finddlg.o differ
+diff --git a/dlls/comdlg32/x86_64-windows/fontdlg.o b/dlls/comdlg32/x86_64-windows/fontdlg.o
+index a050f1758de..b5f9559484d 100644
+Binary files a/dlls/comdlg32/x86_64-windows/fontdlg.o and b/dlls/comdlg32/x86_64-windows/fontdlg.o differ
+diff --git a/dlls/comdlg32/x86_64-windows/itemdlg.o b/dlls/comdlg32/x86_64-windows/itemdlg.o
+index 57b4cca0ede..cd1fd06974b 100644
+Binary files a/dlls/comdlg32/x86_64-windows/itemdlg.o and b/dlls/comdlg32/x86_64-windows/itemdlg.o differ
+diff --git a/dlls/comdlg32/x86_64-windows/printdlg.o b/dlls/comdlg32/x86_64-windows/printdlg.o
+index c2b4e40a03d..518552d708e 100644
+Binary files a/dlls/comdlg32/x86_64-windows/printdlg.o and b/dlls/comdlg32/x86_64-windows/printdlg.o differ
+diff --git a/dlls/d3d11/device.c b/dlls/d3d11/device.c
+index e1a846698e6..8f79d936966 100644
+--- a/dlls/d3d11/device.c
++++ b/dlls/d3d11/device.c
+@@ -2939,10 +2939,20 @@ static void STDMETHODCALLTYPE d3d11_device_context_SwapDeviceContextState(ID3D11
      if (!state)
          return;
  
@@ -22,7 +424,7 @@
      if (!(wined3d_state = d3d_device_context_state_get_wined3d_state(state_impl, device)))
          ERR("Failed to get wined3d state for device context state %p.\n", state_impl);
      wined3d_device_context_set_state(context->wined3d_context, wined3d_state);
-@@ -4111,6 +4121,9 @@
+@@ -4111,6 +4121,9 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateShaderResourceView(ID3D11Dev
  
      TRACE("iface %p, resource %p, desc %p, view %p.\n", iface, resource, desc, view);
  
@@ -32,7 +434,7 @@
      *view = NULL;
  
      if (!resource)
-@@ -4133,6 +4146,9 @@
+@@ -4133,6 +4146,9 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateUnorderedAccessView(ID3D11De
  
      TRACE("iface %p, resource %p, desc %p, view %p.\n", iface, resource, desc, view);
  
@@ -42,7 +444,7 @@
      *view = NULL;
  
      if (FAILED(hr = d3d11_unordered_access_view_create(device, resource, desc, &object)))
-@@ -4152,6 +4168,9 @@
+@@ -4152,6 +4168,9 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateRenderTargetView(ID3D11Devic
  
      TRACE("iface %p, resource %p, desc %p, view %p.\n", iface, resource, desc, view);
  
@@ -52,7 +454,7 @@
      *view = NULL;
  
      if (!resource)
-@@ -4174,6 +4193,9 @@
+@@ -4174,6 +4193,9 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateDepthStencilView(ID3D11Devic
  
      TRACE("iface %p, resource %p, desc %p, view %p.\n", iface, resource, desc, view);
  
@@ -62,7 +464,7 @@
      *view = NULL;
  
      if (FAILED(hr = d3d_depthstencil_view_create(device, resource, desc, &object)))
-@@ -4584,8 +4606,18 @@
+@@ -4584,8 +4606,18 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateDeferredContext(ID3D11Device
  
      TRACE("iface %p, flags %#x, context %p.\n", iface, flags, context);
  
@@ -81,7 +483,7 @@
  
      *context = (ID3D11DeviceContext *)&object->ID3D11DeviceContext4_iface;
      return S_OK;
-@@ -4636,6 +4668,13 @@
+@@ -4636,6 +4668,13 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFormatSupport(ID3D11Device5 *
  
      FIXME("iface %p, format %u, format_support %p partial-stub!\n", iface, format, format_support);
  
@@ -95,9 +497,11 @@
      wined3d_format = wined3dformat_from_dxgi_format(format);
      if (format && !wined3d_format)
      {
---- /tmp/orig/dlls/d3d11/texture.c	2026-07-10 20:08:02.212276654 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/d3d11/texture.c	2026-05-16 15:00:49.875621715 +0900
-@@ -954,8 +954,8 @@
+diff --git a/dlls/d3d11/texture.c b/dlls/d3d11/texture.c
+index b2ef96d3165..b49680e5e99 100644
+--- a/dlls/d3d11/texture.c
++++ b/dlls/d3d11/texture.c
+@@ -954,8 +954,8 @@ static BOOL validate_texture2d_desc(const D3D11_TEXTURE2D_DESC *desc, D3D_FEATUR
              && (~desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE)))
      {
          WARN("D3D11_RESOURCE_MISC_GENERATE_MIPS used without D3D11_BIND_RENDER_TARGET and "
@@ -108,7 +512,7 @@
      }
  
      return TRUE;
-@@ -971,8 +971,9 @@
+@@ -971,8 +971,9 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
  
      if (!validate_texture2d_desc(desc, device->state->feature_level))
      {
@@ -120,7 +524,7 @@
      }
  
      if (!(texture = calloc(1, sizeof(*texture))))
-@@ -1023,13 +1024,44 @@
+@@ -1023,13 +1024,44 @@ HRESULT d3d_texture2d_create(struct d3d_device *device, const D3D11_TEXTURE2D_DE
                  desc->ArraySize, levels, flags, (struct wined3d_sub_resource_data *)data,
                  texture, &d3d_texture2d_wined3d_parent_ops, &texture->wined3d_texture)))
          {
@@ -166,9 +570,32 @@
          texture->desc.MipLevels = levels;
      }
  
---- /tmp/orig/dlls/d3d11/view.c	2026-07-10 20:08:03.042267318 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/d3d11/view.c	2026-05-16 11:52:34.063010388 +0900
-@@ -2219,8 +2219,7 @@
+diff --git a/dlls/d3d11/utils.c b/dlls/d3d11/utils.c
+index de5e08b8e7a..83c262e2d1d 100644
+--- a/dlls/d3d11/utils.c
++++ b/dlls/d3d11/utils.c
+@@ -311,6 +311,7 @@ DXGI_FORMAT dxgi_format_from_wined3dformat(enum wined3d_format_id format)
+         case WINED3DFMT_BC7_TYPELESS: return DXGI_FORMAT_BC7_TYPELESS;
+         case WINED3DFMT_BC7_UNORM: return DXGI_FORMAT_BC7_UNORM;
+         case WINED3DFMT_BC7_UNORM_SRGB: return DXGI_FORMAT_BC7_UNORM_SRGB;
++        case WINED3DFMT_NV12: return DXGI_FORMAT_NV12;
+         case WINED3DFMT_NV12_PLANAR: return DXGI_FORMAT_NV12;
+         case WINED3DFMT_YUY2: return DXGI_FORMAT_YUY2;
+         case WINED3DFMT_B4G4R4A4_UNORM: return DXGI_FORMAT_B4G4R4A4_UNORM;
+@@ -424,7 +425,7 @@ enum wined3d_format_id wined3dformat_from_dxgi_format(DXGI_FORMAT format)
+         case DXGI_FORMAT_BC7_TYPELESS: return WINED3DFMT_BC7_TYPELESS;
+         case DXGI_FORMAT_BC7_UNORM: return WINED3DFMT_BC7_UNORM;
+         case DXGI_FORMAT_BC7_UNORM_SRGB: return WINED3DFMT_BC7_UNORM_SRGB;
+-        case DXGI_FORMAT_NV12: return WINED3DFMT_NV12_PLANAR;
++        case DXGI_FORMAT_NV12: return WINED3DFMT_NV12;
+         case DXGI_FORMAT_YUY2: return WINED3DFMT_YUY2;
+         case DXGI_FORMAT_B4G4R4A4_UNORM: return WINED3DFMT_B4G4R4A4_UNORM;
+         default:
+diff --git a/dlls/d3d11/view.c b/dlls/d3d11/view.c
+index ec55dba5cf3..6aa310d71ad 100644
+--- a/dlls/d3d11/view.c
++++ b/dlls/d3d11/view.c
+@@ -2219,8 +2219,7 @@ static HRESULT d3d_shader_resource_view_init(struct d3d_shader_resource_view *vi
      if (FAILED(hr))
          return hr;
  
@@ -178,7 +605,7 @@
  
      wined3d_mutex_lock();
      if (!(wined3d_resource = wined3d_resource_from_d3d11_resource(resource)))
-@@ -2233,9 +2232,22 @@
+@@ -2233,9 +2232,22 @@ static HRESULT d3d_shader_resource_view_init(struct d3d_shader_resource_view *vi
      if (FAILED(hr = wined3d_shader_resource_view_create(&wined3d_desc, wined3d_resource,
              view, &d3d_shader_resource_view_wined3d_parent_ops, &view->wined3d_view)))
      {
@@ -204,9 +631,35 @@
      }
  
      wined3d_private_store_init(&view->private_store);
---- /tmp/orig/dlls/dwrite/layout.c	2026-07-10 20:08:01.015290123 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/dwrite/layout.c	2026-05-20 17:41:43.687495567 +0900
-@@ -1600,9 +1600,12 @@
+diff --git a/dlls/d3d11/x86_64-windows/d3d11.dll b/dlls/d3d11/x86_64-windows/d3d11.dll
+index f157e70f5a6..1576a7bd3c2 100644
+Binary files a/dlls/d3d11/x86_64-windows/d3d11.dll and b/dlls/d3d11/x86_64-windows/d3d11.dll differ
+diff --git a/dlls/d3d11/x86_64-windows/d3d11_main.o b/dlls/d3d11/x86_64-windows/d3d11_main.o
+index f36bfc3381d..f6740d6b903 100644
+Binary files a/dlls/d3d11/x86_64-windows/d3d11_main.o and b/dlls/d3d11/x86_64-windows/d3d11_main.o differ
+diff --git a/dlls/d3d11/x86_64-windows/decoder.o b/dlls/d3d11/x86_64-windows/decoder.o
+index 618a924a3d5..d10034305c9 100644
+Binary files a/dlls/d3d11/x86_64-windows/decoder.o and b/dlls/d3d11/x86_64-windows/decoder.o differ
+diff --git a/dlls/d3d11/x86_64-windows/device.o b/dlls/d3d11/x86_64-windows/device.o
+index 581da43194d..7709bc564c4 100644
+Binary files a/dlls/d3d11/x86_64-windows/device.o and b/dlls/d3d11/x86_64-windows/device.o differ
+diff --git a/dlls/d3d11/x86_64-windows/shader.o b/dlls/d3d11/x86_64-windows/shader.o
+index 78171c5d94b..c635ab10f59 100644
+Binary files a/dlls/d3d11/x86_64-windows/shader.o and b/dlls/d3d11/x86_64-windows/shader.o differ
+diff --git a/dlls/d3d11/x86_64-windows/texture.o b/dlls/d3d11/x86_64-windows/texture.o
+index 18fd73f3e87..a813f133826 100644
+Binary files a/dlls/d3d11/x86_64-windows/texture.o and b/dlls/d3d11/x86_64-windows/texture.o differ
+diff --git a/dlls/d3d11/x86_64-windows/utils.o b/dlls/d3d11/x86_64-windows/utils.o
+index 47aaa451e88..d4d58c69d20 100644
+Binary files a/dlls/d3d11/x86_64-windows/utils.o and b/dlls/d3d11/x86_64-windows/utils.o differ
+diff --git a/dlls/d3d11/x86_64-windows/view.o b/dlls/d3d11/x86_64-windows/view.o
+index 9ebb26006a3..493c8d2787f 100644
+Binary files a/dlls/d3d11/x86_64-windows/view.o and b/dlls/d3d11/x86_64-windows/view.o differ
+diff --git a/dlls/dwrite/layout.c b/dlls/dwrite/layout.c
+index e362aba59ef..e32c483714d 100644
+--- a/dlls/dwrite/layout.c
++++ b/dlls/dwrite/layout.c
+@@ -1600,9 +1600,12 @@ static HRESULT layout_add_effective_run(struct dwrite_textlayout *layout, const
  
      run->effect = params->effect;
      run->underlined = params->underline;
@@ -221,7 +674,7 @@
  
      /* Strikethrough style is guaranteed to be consistent within effective run,
         its width equals to run width, thickness and offset are derived from
-@@ -1915,6 +1918,14 @@
+@@ -1915,6 +1918,14 @@ static void layout_apply_par_alignment(struct dwrite_textlayout *layout)
              run->origin.y = pos_y - run->baseline;
          }
  
@@ -236,7 +689,7 @@
          origin_y += line->metrics.height;
      }
  }
-@@ -3888,6 +3899,9 @@
+@@ -3888,6 +3899,9 @@ static HRESULT WINAPI dwritetextlayout_GetDrawingEffect(IDWriteTextLayout4 *ifac
  
      TRACE("%p, %u, %p, %p.\n", iface, position, effect, r);
  
@@ -246,7 +699,7 @@
      range = (struct layout_range_iface *)get_layout_range_header_by_pos(&layout->effects, position);
      *effect = range->iface;
      if (*effect)
-@@ -4132,8 +4146,10 @@
+@@ -4132,8 +4146,10 @@ static HRESULT WINAPI dwritetextlayout_GetMetrics(IDWriteTextLayout4 *iface, DWR
  
      TRACE("%p, %p.\n", iface, metrics);
  
@@ -258,7 +711,7 @@
          memcpy(metrics, &layout->metrics, sizeof(*metrics));
  
      return hr;
-@@ -4378,9 +4394,244 @@
+@@ -4378,9 +4394,244 @@ width_done:
  static HRESULT WINAPI dwritetextlayout_HitTestPoint(IDWriteTextLayout4 *iface,
      FLOAT pointX, FLOAT pointY, BOOL* is_trailinghit, BOOL* is_inside, DWRITE_HIT_TEST_METRICS *metrics)
  {
@@ -267,7 +720,8 @@
 +    struct layout_line *line, *last_line;
 +    struct layout_effective_run *run;
 +    HRESULT hr;
-+
+ 
+-    return E_NOTIMPL;
 +    TRACE("%p, %.8e, %.8e, %p, %p, %p).\n", iface, pointX, pointY, is_trailinghit, is_inside, metrics);
 +
 +    if (FAILED(hr = layout_compute_effective_runs(layout)))
@@ -467,8 +921,7 @@
 +                metrics->width = layout->metrics.layoutWidth;
 +                metrics->bidiLevel = 0;
 +            }
- 
--    return E_NOTIMPL;
++
 +            TRACE("Below -> textPosition=%u\n", metrics->textPosition);
 +            return S_OK;
 +        }
@@ -505,7 +958,7 @@
  }
  
  static struct layout_effective_run *layout_get_effective_run_for_position(struct dwrite_textlayout *layout,
-@@ -4392,7 +4643,14 @@
+@@ -4392,7 +4643,14 @@ static struct layout_effective_run *layout_get_effective_run_for_position(struct
      LIST_FOR_EACH_ENTRY(run, &layout->effective_runs, struct layout_effective_run, entry)
      {
          if (run->start_position <= position && position < run->start_position + run->length)
@@ -520,7 +973,7 @@
      }
  
      return NULL;
-@@ -4407,6 +4665,10 @@
+@@ -4407,6 +4665,10 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
  
      TRACE("%p, %u, %d, %p, %p, %p.\n", iface, position, is_trailinghit, point_x, point_y, metrics);
  
@@ -531,7 +984,7 @@
      if (FAILED(hr = layout_compute_effective_runs(layout)))
          return hr;
  
-@@ -4418,19 +4680,49 @@
+@@ -4418,19 +4680,49 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
          UINT8 level;
  
          run = layout_get_trailing_effective_run(layout);
@@ -586,7 +1039,7 @@
          *point_x = metrics->left;
          *point_y = metrics->top;
          return S_OK;
-@@ -4438,6 +4730,49 @@
+@@ -4438,6 +4730,49 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
  
      if (!(run = layout_get_effective_run_for_position(layout, position)))
      {
@@ -636,7 +1089,7 @@
          FIXME("Couldn't find a run for position %u\n", position);
          return E_FAIL;
      }
-@@ -4489,7 +4824,7 @@
+@@ -4489,7 +4824,7 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextPosition(IDWriteTextLayout4 *i
      }
  
      *point_x = !!(metrics->bidiLevel & 1) == !!is_trailinghit ? metrics->left : metrics->left + metrics->width;
@@ -645,7 +1098,7 @@
  
      return S_OK;
  }
-@@ -4498,10 +4833,261 @@
+@@ -4498,10 +4833,261 @@ static HRESULT WINAPI dwritetextlayout_HitTestTextRange(IDWriteTextLayout4 *ifac
      UINT32 textPosition, UINT32 textLength, FLOAT originX, FLOAT originY,
      DWRITE_HIT_TEST_METRICS *metrics, UINT32 max_metricscount, UINT32* actual_metricscount)
  {
@@ -668,7 +1121,8 @@
 +        *actual_metricscount = 0;
 +    if (max_metricscount && !metrics)
 +        return E_INVALIDARG;
-+
+ 
+-    return E_NOTIMPL;
 +    if (FAILED(hr = layout_compute_effective_runs(layout)))
 +        return hr;
 +
@@ -791,8 +1245,7 @@
 +                has_pending = FALSE;
 +                pending_line = NULL;
 +            }
- 
--    return E_NOTIMPL;
++
 +            line = run->line;
 +
 +            /* Skip NO_VISUAL runs on lines with visible content; they have
@@ -910,423 +1363,71 @@
  }
  
  static HRESULT WINAPI dwritetextlayout1_SetPairKerning(IDWriteTextLayout4 *iface, BOOL is_pairkerning_enabled,
---- /tmp/orig/dlls/comdlg32/filedlg.c	2026-07-10 20:07:59.067312062 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/comdlg32/filedlg.c	2026-05-18 22:08:07.556843409 +0900
-@@ -558,6 +558,23 @@
-         ret = FALSE;
-     }
- 
-+    /* set the lpstrFileTitle */
-+    if (ret && info->ofnInfos->lpstrFile && info->ofnInfos->lpstrFileTitle)
-+    {
-+        if (info->unicode)
-+        {
-+            LPOPENFILENAMEW ofn = info->ofnInfos;
-+            WCHAR *file_title = PathFindFileNameW(ofn->lpstrFile);
-+            lstrcpynW(ofn->lpstrFileTitle, file_title, ofn->nMaxFileTitle);
-+        }
-+        else
-+        {
-+            LPOPENFILENAMEA ofn = (LPOPENFILENAMEA)info->ofnInfos;
-+            char *file_title = PathFindFileNameA(ofn->lpstrFile);
-+            lstrcpynA(ofn->lpstrFileTitle, file_title, ofn->nMaxFileTitle);
-+        }
-+    }
-+
-     if (current_dir)
-     {
-         SetCurrentDirectoryW(current_dir);
-@@ -2868,23 +2885,6 @@
-               fodInfos->ofnInfos->nFileExtension = (*lpszTemp) ? (lpszTemp - tempFileA) + 1 : 0;
-           }
- 
--          /* set the lpstrFileTitle */
--          if(fodInfos->ofnInfos->lpstrFileTitle)
--	  {
--            LPWSTR lpstrFileTitle = PathFindFileNameW(lpstrPathAndFile);
--            if(fodInfos->unicode)
--            {
--              LPOPENFILENAMEW ofn = fodInfos->ofnInfos;
--	      lstrcpynW(ofn->lpstrFileTitle, lpstrFileTitle, ofn->nMaxFileTitle);
--            }
--            else
--            {
--              LPOPENFILENAMEA ofn = (LPOPENFILENAMEA)fodInfos->ofnInfos;
--              WideCharToMultiByte(CP_ACP, 0, lpstrFileTitle, -1,
--                    ofn->lpstrFileTitle, ofn->nMaxFileTitle, NULL, NULL);
--            }
--	  }
--
-           /* copy currently selected filter to lpstrCustomFilter */
-           if (fodInfos->ofnInfos->lpstrCustomFilter)
-           {
-@@ -4164,9 +4164,149 @@
-  *    FALSE on cancel, error, close or filename-does-not-fit-in-buffer.
-  *
-  */
-+/* Try native file dialog (zenity) for GetOpenFileNameW/GetSaveFileNameW.
-+ * Returns TRUE on success, FALSE on cancel/error, -1 to fall back to built-in dialog. */
-+static int try_native_getopenfilename(OPENFILENAMEW *ofn, BOOL is_save)
-+{
-+    static BOOL checked = FALSE;
-+    static BOOL use_native = FALSE;
-+    WCHAR cmdline[4096], exe_path[MAX_PATH], temp_path[MAX_PATH], result_path[MAX_PATH];
-+    PROCESS_INFORMATION pi;
-+    STARTUPINFOW si;
-+    DWORD exit_code, read_len;
-+    HANDLE hFile;
-+    char buf[4096];
-+    WCHAR resultW[MAX_PATH];
-+    int result_len;
-+    UINT i;
-+
-+    if (!checked)
-+    {
-+        const char *env = getenv("WINE_NATIVE_FILE_DIALOG");
-+        if (env && (!strcmp(env, "0") || !strcmp(env, "false")))
-+            use_native = FALSE;
-+        else
-+            use_native = TRUE;
-+        checked = TRUE;
-+    }
-+    if (!use_native) return -1;
-+
-+    FIXME("Using native file dialog\n");
-+
-+    /* Build command line */
-+    GetSystemDirectoryW(exe_path, MAX_PATH);
-+    lstrcatW(exe_path, L"\\winefiledialog.exe");
-+
-+    lstrcpyW(cmdline, L"\"");
-+    lstrcatW(cmdline, exe_path);
-+    lstrcatW(cmdline, L"\"");
-+
-+    if (is_save)
-+        lstrcatW(cmdline, L" --save");
-+    else
-+        lstrcatW(cmdline, L" --open");
-+
-+    if (ofn->lpstrTitle && ofn->lpstrTitle[0])
-+    {
-+        lstrcatW(cmdline, L" --title \"");
-+        lstrcatW(cmdline, ofn->lpstrTitle);
-+        lstrcatW(cmdline, L"\"");
-+    }
-+
-+    /* Initial dir: prefer lpstrInitialDir, else directory part of lpstrFile */
-+    if (ofn->lpstrInitialDir && ofn->lpstrInitialDir[0])
-+    {
-+        lstrcatW(cmdline, L" --filename \"");
-+        lstrcatW(cmdline, ofn->lpstrInitialDir);
-+        lstrcatW(cmdline, L"\"");
-+    }
-+
-+    /* Convert lpstrFilter (double-null pairs) to --file-filter args */
-+    if (ofn->lpstrFilter)
-+    {
-+        const WCHAR *fp = ofn->lpstrFilter;
-+        while (*fp)
-+        {
-+            const WCHAR *name = fp;
-+            while (*fp) fp++;
-+            fp++;
-+            const WCHAR *spec = fp;
-+            while (*fp) fp++;
-+            fp++;
-+
-+            /* Build: --file-filter "name|spec" */
-+            lstrcatW(cmdline, L" --file-filter \"");
-+            lstrcatW(cmdline, name);
-+            lstrcatW(cmdline, L"|");
-+            lstrcatW(cmdline, spec);
-+            lstrcatW(cmdline, L"\"");
-+        }
-+    }
-+
-+    TRACE("Launching: %s\n", wine_dbgstr_w(cmdline));
-+
-+    /* Result file path */
-+    GetTempPathW(MAX_PATH, temp_path);
-+    lstrcpyW(result_path, temp_path);
-+    lstrcatW(result_path, L"winefiledialog_result.txt");
-+    DeleteFileW(result_path);
-+
-+    /* Launch */
-+    memset(&si, 0, sizeof(si));
-+    si.cb = sizeof(si);
-+    if (!CreateProcessW(exe_path, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
-+    {
-+        ERR("Failed to launch winefiledialog.exe, error=%u\n", (unsigned)GetLastError());
-+        return -1;
-+    }
-+    CloseHandle(pi.hThread);
-+    WaitForSingleObject(pi.hProcess, 30000);
-+    GetExitCodeProcess(pi.hProcess, &exit_code);
-+    CloseHandle(pi.hProcess);
-+
-+    /* Read result */
-+    hFile = CreateFileW(result_path, GENERIC_READ, FILE_SHARE_READ, NULL,
-+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-+    if (hFile == INVALID_HANDLE_VALUE)
-+        return FALSE;
-+
-+    ReadFile(hFile, buf, sizeof(buf) - 1, &read_len, NULL);
-+    buf[read_len] = '\0';
-+    CloseHandle(hFile);
-+    DeleteFileW(result_path);
-+
-+    /* Trim trailing newline */
-+    while (read_len > 0 && (buf[read_len-1] == '\n' || buf[read_len-1] == '\r'))
-+        buf[--read_len] = '\0';
-+    if (read_len == 0) return FALSE;
-+
-+    /* Convert to wide char */
-+    result_len = MultiByteToWideChar(CP_UTF8, 0, buf, read_len + 1, resultW, MAX_PATH);
-+    if (result_len <= 0 || result_len > ofn->nMaxFile)
-+    {
-+        COMDLG32_SetCommDlgExtendedError(FNERR_BUFFERTOOSMALL);
-+        return FALSE;
-+    }
-+
-+    /* Copy result to lpstrFile */
-+    lstrcpyW(ofn->lpstrFile, resultW);
-+
-+    /* Set nFileOffset: find last backslash */
-+    for (i = 0; resultW[i]; i++)
-+        if (resultW[i] == '\\') ofn->nFileOffset = i + 1;
-+    if (ofn->nFileOffset == 0) ofn->nFileOffset = 0;
-+
-+    /* Set nFileExtension: find last dot after offset */
-+    ofn->nFileExtension = 0;
-+    for (i = ofn->nFileOffset; resultW[i]; i++)
-+        if (resultW[i] == '.') ofn->nFileExtension = i;
-+
-+    return TRUE;
-+}
-+
- BOOL WINAPI GetOpenFileNameW(OPENFILENAMEW *ofn)
- {
--    TRACE("flags 0x%08lx\n", ofn->Flags);
-+    FIXME("[v12.7-STAGING] GetOpenFileNameW called, flags 0x%08lx\n", ofn->Flags);
- 
-     if (!valid_struct_size( ofn->lStructSize ))
-     {
-@@ -4174,6 +4314,12 @@
-         return FALSE;
-     }
- 
-+    /* Try native dialog */
-+    {
-+        int ret = try_native_getopenfilename(ofn, FALSE);
-+        if (ret != -1) return ret;
-+    }
-+
-     /* OFN_FILEMUSTEXIST implies OFN_PATHMUSTEXIST */
-     if (ofn->Flags & OFN_FILEMUSTEXIST)
-         ofn->Flags |= OFN_PATHMUSTEXIST;
---- /tmp/orig/dlls/comdlg32/itemdlg.c	2026-07-10 20:07:59.689305055 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/comdlg32/itemdlg.c	2026-05-18 22:08:09.613841490 +0900
-@@ -19,6 +19,7 @@
-  */
- 
- #include <stdarg.h>
-+#include <stdlib.h>
- 
- #define COBJMACROS
- #include "windef.h"
-@@ -32,6 +33,8 @@
- #include "cdlg.h"
- #include "filedlgbrowser.h"
- 
-+#include "shobjidl.h"
-+
- #include "wine/debug.h"
- #include "wine/list.h"
- 
-@@ -2519,13 +2522,180 @@
-     return ref;
- }
- 
-+/* Try native file dialog (zenity) via winefiledialog.exe helper.
-+ * Returns S_OK on success, S_FALSE to fall back, or an error code. */
-+static HRESULT try_native_file_dialog(FileDialogImpl *This)
-+{
-+    static BOOL checked = FALSE;
-+    static BOOL use_native = FALSE;
-+    WCHAR cmdline[4096], exe_path[MAX_PATH], temp_path[MAX_PATH], result_path[MAX_PATH];
-+    PROCESS_INFORMATION pi;
-+    STARTUPINFOW si;
-+    DWORD exit_code;
-+    HANDLE hFile;
-+    char buf[4096];
-+    DWORD read_len;
-+    WCHAR pathW[MAX_PATH];
-+    IShellItem *psi;
-+    IShellItemArray *psia;
-+    HRESULT hr;
-+    UINT i;
-+
-+    if (!checked)
-+    {
-+        const char *env = getenv("WINE_NATIVE_FILE_DIALOG");
-+        if (env && (!strcmp(env, "0") || !strcmp(env, "false")))
-+            use_native = FALSE;
-+        else
-+            use_native = TRUE;
-+        checked = TRUE;
-+    }
-+    if (!use_native) return S_FALSE;
-+
-+    FIXME("Using native file dialog via winefiledialog.exe\n");
-+
-+    /* Build command line */
-+    GetSystemDirectoryW(exe_path, MAX_PATH);
-+    lstrcatW(exe_path, L"\\winefiledialog.exe");
-+
-+    lstrcpyW(cmdline, L"\"");
-+    lstrcatW(cmdline, exe_path);
-+    lstrcatW(cmdline, L"\" --open");
-+    if (This->dlg_type == ITEMDLG_TYPE_SAVE)
-+        lstrcatW(cmdline, L" --save");
-+    if (This->options & FOS_PICKFOLDERS)
-+        lstrcatW(cmdline, L" --folder");
-+    if (This->options & FOS_ALLOWMULTISELECT)
-+        lstrcatW(cmdline, L" --multi");
-+    if (This->custom_title && This->custom_title[0])
-+    {
-+        lstrcatW(cmdline, L" --title \"");
-+        lstrcatW(cmdline, This->custom_title);
-+        lstrcatW(cmdline, L"\"");
-+    }
-+    if (This->set_filename && This->set_filename[0])
-+    {
-+        lstrcatW(cmdline, L" --filename \"");
-+        lstrcatW(cmdline, This->set_filename);
-+        lstrcatW(cmdline, L"\"");
-+    }
-+    for (i = 0; i < This->filterspec_count; i++)
-+    {
-+        lstrcatW(cmdline, L" --file-filter \"");
-+        lstrcatW(cmdline, This->filterspecs[i].pszName);
-+        lstrcatW(cmdline, L"|");
-+        lstrcatW(cmdline, This->filterspecs[i].pszSpec);
-+        lstrcatW(cmdline, L"\"");
-+    }
-+
-+    TRACE("Launching: %s\n", wine_dbgstr_w(cmdline));
-+
-+    /* Create result file path */
-+    GetTempPathW(MAX_PATH, temp_path);
-+    lstrcpyW(result_path, temp_path);
-+    lstrcatW(result_path, L"winefiledialog_result.txt");
-+    /* Delete previous result file if any */
-+    DeleteFileW(result_path);
-+
-+    /* Launch winefiledialog.exe */
-+    memset(&si, 0, sizeof(si));
-+    si.cb = sizeof(si);
-+    if (!CreateProcessW(exe_path, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
-+    {
-+        WARN("Failed to launch winefiledialog.exe (error %lu)\n", GetLastError());
-+        return S_FALSE;
-+    }
-+
-+    WaitForSingleObject(pi.hProcess, INFINITE);
-+    GetExitCodeProcess(pi.hProcess, &exit_code);
-+    CloseHandle(pi.hThread);
-+    CloseHandle(pi.hProcess);
-+
-+    if (exit_code != 0)
-+    {
-+        TRACE("winefiledialog.exe cancelled (exit %lu)\n", exit_code);
-+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-+    }
-+
-+    /* Read result file */
-+    hFile = CreateFileW(result_path, GENERIC_READ, FILE_SHARE_READ, NULL,
-+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-+    if (hFile == INVALID_HANDLE_VALUE)
-+    {
-+        WARN("Failed to open result file (error %lu)\n", GetLastError());
-+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-+    }
-+
-+    if (!ReadFile(hFile, buf, sizeof(buf) - 1, &read_len, NULL) || read_len == 0)
-+    {
-+        CloseHandle(hFile);
-+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-+    }
-+    CloseHandle(hFile);
-+    buf[read_len] = '\0';
-+
-+    /* Strip trailing newline */
-+    while (read_len > 0 && (buf[read_len - 1] == '\n' || buf[read_len - 1] == '\r'))
-+        buf[--read_len] = '\0';
-+
-+    if (read_len == 0)
-+    {
-+        TRACE("Empty result (cancelled)\n");
-+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-+    }
-+
-+    TRACE("Selected path: %s\n", wine_dbgstr_a(buf));
-+
-+    /* Convert UTF-8 result to WCHAR */
-+    if (!MultiByteToWideChar(CP_UTF8, 0, buf, -1, pathW, ARRAY_SIZE(pathW)))
-+    {
-+        ERR("Failed to convert result to wide chars\n");
-+        return E_FAIL;
-+    }
-+
-+    /* Create IShellItem from path */
-+    hr = SHCreateItemFromParsingName(pathW, NULL, &IID_IShellItem, (void**)&psi);
-+    if (FAILED(hr))
-+    {
-+        ERR("SHCreateItemFromParsingName failed: %08lx\n", hr);
-+        return E_FAIL;
-+    }
-+
-+    /* Wrap in IShellItemArray */
-+    hr = SHCreateShellItemArrayFromShellItem(psi, &IID_IShellItemArray, (void**)&psia);
-+    IShellItem_Release(psi);
-+    if (FAILED(hr))
-+    {
-+        ERR("SHCreateShellItemArrayFromShellItem failed: %08lx\n", hr);
-+        return E_FAIL;
-+    }
-+
-+    /* Store result */
-+    This->psia_results = psia;
-+
-+    /* Notify FileOk event */
-+    if (FAILED(hr = events_OnFileOk(This)))
-+    {
-+        IShellItemArray_Release(This->psia_results);
-+        This->psia_results = NULL;
-+        return hr;
-+    }
-+
-+    return S_OK;
-+}
-+
- static HRESULT WINAPI IFileDialog2_fnShow(IFileDialog2 *iface, HWND hwndOwner)
- {
-     FileDialogImpl *This = impl_from_IFileDialog2(iface);
-+    HRESULT hr;
-     TRACE("%p (%p)\n", iface, hwndOwner);
- 
-     This->opendropdown_has_selection = FALSE;
- 
-+    hr = try_native_file_dialog(This);
-+    if (hr != S_FALSE)
-+        return hr;
-+
-     return create_dialog(This, hwndOwner);
- }
- 
---- /tmp/orig/dlls/ole32/ole2.c	2026-07-10 20:08:00.401297036 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/ole32/ole2.c	2026-06-05 22:04:27.467019629 +0900
-@@ -2160,9 +2160,16 @@
+diff --git a/dlls/dwrite/x86_64-windows/analyzer.o b/dlls/dwrite/x86_64-windows/analyzer.o
+index 0f7cb23a629..0134b35ed27 100644
+Binary files a/dlls/dwrite/x86_64-windows/analyzer.o and b/dlls/dwrite/x86_64-windows/analyzer.o differ
+diff --git a/dlls/dwrite/x86_64-windows/dwrite.dll b/dlls/dwrite/x86_64-windows/dwrite.dll
+index b12cb0d34a0..1233ea0cc06 100644
+Binary files a/dlls/dwrite/x86_64-windows/dwrite.dll and b/dlls/dwrite/x86_64-windows/dwrite.dll differ
+diff --git a/dlls/dwrite/x86_64-windows/font.o b/dlls/dwrite/x86_64-windows/font.o
+index 73eaec80979..90b15046b22 100644
+Binary files a/dlls/dwrite/x86_64-windows/font.o and b/dlls/dwrite/x86_64-windows/font.o differ
+diff --git a/dlls/dwrite/x86_64-windows/layout.o b/dlls/dwrite/x86_64-windows/layout.o
+index 0b7e0cab296..b550950883e 100644
+Binary files a/dlls/dwrite/x86_64-windows/layout.o and b/dlls/dwrite/x86_64-windows/layout.o differ
+diff --git a/dlls/dwrite/x86_64-windows/main.o b/dlls/dwrite/x86_64-windows/main.o
+index 07241063340..bd3c8567862 100644
+Binary files a/dlls/dwrite/x86_64-windows/main.o and b/dlls/dwrite/x86_64-windows/main.o differ
+diff --git a/dlls/dwrite/x86_64-windows/opentype.o b/dlls/dwrite/x86_64-windows/opentype.o
+index e5ac8cc37e9..88db367d810 100644
+Binary files a/dlls/dwrite/x86_64-windows/opentype.o and b/dlls/dwrite/x86_64-windows/opentype.o differ
+diff --git a/dlls/dxgi/utils.c b/dlls/dxgi/utils.c
+index 35fcc076ccb..820e95a6e2d 100644
+--- a/dlls/dxgi/utils.c
++++ b/dlls/dxgi/utils.c
+@@ -263,6 +263,7 @@ DXGI_FORMAT dxgi_format_from_wined3dformat(enum wined3d_format_id format)
+         case WINED3DFMT_BC7_TYPELESS: return DXGI_FORMAT_BC7_TYPELESS;
+         case WINED3DFMT_BC7_UNORM: return DXGI_FORMAT_BC7_UNORM;
+         case WINED3DFMT_BC7_UNORM_SRGB: return DXGI_FORMAT_BC7_UNORM_SRGB;
++        case WINED3DFMT_NV12: return DXGI_FORMAT_NV12;
+         case WINED3DFMT_NV12_PLANAR: return DXGI_FORMAT_NV12;
+         case WINED3DFMT_YUY2: return DXGI_FORMAT_YUY2;
+         case WINED3DFMT_B4G4R4A4_UNORM: return DXGI_FORMAT_B4G4R4A4_UNORM;
+@@ -376,7 +377,7 @@ enum wined3d_format_id wined3dformat_from_dxgi_format(DXGI_FORMAT format)
+         case DXGI_FORMAT_BC7_TYPELESS: return WINED3DFMT_BC7_TYPELESS;
+         case DXGI_FORMAT_BC7_UNORM: return WINED3DFMT_BC7_UNORM;
+         case DXGI_FORMAT_BC7_UNORM_SRGB: return WINED3DFMT_BC7_UNORM_SRGB;
+-        case DXGI_FORMAT_NV12: return WINED3DFMT_NV12_PLANAR;
++        case DXGI_FORMAT_NV12: return WINED3DFMT_NV12;
+         case DXGI_FORMAT_YUY2: return WINED3DFMT_YUY2;
+         case DXGI_FORMAT_B4G4R4A4_UNORM: return WINED3DFMT_B4G4R4A4_UNORM;
+         default:
+diff --git a/dlls/dxgi/x86_64-windows/adapter.o b/dlls/dxgi/x86_64-windows/adapter.o
+index 0490ff92489..63796d493ba 100644
+Binary files a/dlls/dxgi/x86_64-windows/adapter.o and b/dlls/dxgi/x86_64-windows/adapter.o differ
+diff --git a/dlls/dxgi/x86_64-windows/dxgi.dll b/dlls/dxgi/x86_64-windows/dxgi.dll
+index 8e071ad1b97..26bef0872b9 100644
+Binary files a/dlls/dxgi/x86_64-windows/dxgi.dll and b/dlls/dxgi/x86_64-windows/dxgi.dll differ
+diff --git a/dlls/dxgi/x86_64-windows/dxgi_main.o b/dlls/dxgi/x86_64-windows/dxgi_main.o
+index cf777ca1609..99e397b7c02 100644
+Binary files a/dlls/dxgi/x86_64-windows/dxgi_main.o and b/dlls/dxgi/x86_64-windows/dxgi_main.o differ
+diff --git a/dlls/dxgi/x86_64-windows/factory.o b/dlls/dxgi/x86_64-windows/factory.o
+index e7f1a3a5865..e9de541e20f 100644
+Binary files a/dlls/dxgi/x86_64-windows/factory.o and b/dlls/dxgi/x86_64-windows/factory.o differ
+diff --git a/dlls/dxgi/x86_64-windows/resource.o b/dlls/dxgi/x86_64-windows/resource.o
+index ca0b62ded89..c3d06c53bde 100644
+Binary files a/dlls/dxgi/x86_64-windows/resource.o and b/dlls/dxgi/x86_64-windows/resource.o differ
+diff --git a/dlls/dxgi/x86_64-windows/swapchain.o b/dlls/dxgi/x86_64-windows/swapchain.o
+index 4278e8bf8e3..e542c84f138 100644
+Binary files a/dlls/dxgi/x86_64-windows/swapchain.o and b/dlls/dxgi/x86_64-windows/swapchain.o differ
+diff --git a/dlls/dxgi/x86_64-windows/utils.o b/dlls/dxgi/x86_64-windows/utils.o
+index 1938cec1928..fb71891f637 100644
+Binary files a/dlls/dxgi/x86_64-windows/utils.o and b/dlls/dxgi/x86_64-windows/utils.o differ
+diff --git a/dlls/ole32/ole2.c b/dlls/ole32/ole2.c
+index 36838628c65..5537c50d086 100644
+--- a/dlls/ole32/ole2.c
++++ b/dlls/ole32/ole2.c
+@@ -2160,9 +2160,16 @@ static LRESULT WINAPI OLEDD_DragTrackerWindowProc(
      case WM_RBUTTONDOWN:
      {
        TrackerWindowInfo *trackerInfo = (TrackerWindowInfo*)GetWindowLongPtrA(hwnd, 0);
@@ -1345,7 +1446,7 @@
      }
      case WM_DESTROY:
      {
-@@ -2287,6 +2294,7 @@
+@@ -2287,6 +2294,7 @@ static void OLEDD_TrackStateChange(TrackerWindowInfo* trackerInfo)
     * (i.e. by running message loop) so avoid recursive call chain.
     */
    if (trackerInfo->inTrackCall) return;
@@ -1353,8 +1454,1230 @@
    trackerInfo->inTrackCall = TRUE;
  
    /*
---- /tmp/orig/programs/explorer/explorer.c	2026-07-10 20:08:03.839258357 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/programs/explorer/explorer.c	2026-05-24 17:51:40.865423340 +0900
+diff --git a/dlls/shell32/clipboard.c b/dlls/shell32/clipboard.c
+index 6ab2ad16c9d..102f2e369dd 100644
+--- a/dlls/shell32/clipboard.c
++++ b/dlls/shell32/clipboard.c
+@@ -159,6 +159,9 @@ HGLOBAL RenderFILENAMEA(const ITEMIDLIST *pidlRoot, const ITEMIDLIST **apidl, un
+ 
+ 	TRACE("(%p,%p,%u)\n", pidlRoot, apidl, cidl);
+ 
++	if (!apidl || !cidl || !apidl[0])
++		return 0;
++
+ 	/* get path of combined pidl */
+ 	pidl = ILCombine(pidlRoot, apidl[0]);
+ 	if (!pidl)
+@@ -191,6 +194,9 @@ HGLOBAL RenderFILENAMEW(const ITEMIDLIST *pidlRoot, const ITEMIDLIST **apidl, un
+ 
+ 	TRACE("(%p,%p,%u)\n", pidlRoot, apidl, cidl);
+ 
++	if (!apidl || !cidl || !apidl[0])
++		return 0;
++
+ 	/* get path of combined pidl */
+ 	pidl = ILCombine(pidlRoot, apidl[0]);
+ 	if (!pidl)
+diff --git a/dlls/shell32/dataobject.c b/dlls/shell32/dataobject.c
+index d0ed644c437..151fdeeaaab 100644
+--- a/dlls/shell32/dataobject.c
++++ b/dlls/shell32/dataobject.c
+@@ -458,16 +458,20 @@ IDataObject *IDataObject_Constructor(HWND hwnd, const ITEMIDLIST *root_pidl,
+ 
+     obj->ref = 1;
+     obj->IDataObject_iface.lpVtbl = &dtovt;
+-    obj->data = calloc(4, sizeof(*obj->data));
+-    obj->data[0].cf = RegisterClipboardFormatW(CFSTR_SHELLIDLISTW);
+-    obj->data[0].global = RenderSHELLIDLIST(root_pidl, pidls, pidl_count);
+-    obj->data[1].cf = CF_HDROP;
+-    obj->data[1].global = RenderHDROP(root_pidl, pidls, pidl_count);
+-    obj->data[2].cf = RegisterClipboardFormatA(CFSTR_FILENAMEA);
+-    obj->data[2].global = RenderFILENAMEA(root_pidl, pidls, pidl_count);
+-    obj->data[3].cf = RegisterClipboardFormatW(CFSTR_FILENAMEW);
+-    obj->data[3].global = RenderFILENAMEW(root_pidl, pidls, pidl_count);
+-    obj->data_count = 4;
++
++    if (pidl_count && pidls)
++    {
++        obj->data = calloc(4, sizeof(*obj->data));
++        obj->data[0].cf = RegisterClipboardFormatW(CFSTR_SHELLIDLISTW);
++        obj->data[0].global = RenderSHELLIDLIST(root_pidl, pidls, pidl_count);
++        obj->data[1].cf = CF_HDROP;
++        obj->data[1].global = RenderHDROP(root_pidl, pidls, pidl_count);
++        obj->data[2].cf = RegisterClipboardFormatA(CFSTR_FILENAMEA);
++        obj->data[2].global = RenderFILENAMEA(root_pidl, pidls, pidl_count);
++        obj->data[3].cf = RegisterClipboardFormatW(CFSTR_FILENAMEW);
++        obj->data[3].global = RenderFILENAMEW(root_pidl, pidls, pidl_count);
++        obj->data_count = 4;
++    }
+ 
+     TRACE("Created data object %p.\n", obj);
+     return &obj->IDataObject_iface;
+diff --git a/dlls/shell32/debughlp.c b/dlls/shell32/debughlp.c
+index fca8070439a..f4b82d93f2c 100644
+--- a/dlls/shell32/debughlp.c
++++ b/dlls/shell32/debughlp.c
+@@ -373,9 +373,10 @@ BOOL pcheck( LPCITEMIDLIST pidl )
+         case PT_IESPECIAL1:
+         case PT_YAGUID:
+         case PT_IESPECIAL2:
+-        case PT_SHARE:
+-            break;
+-        default:
++case PT_SHARE:
++         case PT_UNIXMOUNT:
++             break;
++         default:
+             ERR("unknown IDLIST %p [%p] size=%u type=%lx\n",
+                 pidl, pidltemp, pidltemp->mkid.cb,type );
+             dump_pidl_hex( pidltemp );
+diff --git a/dlls/shell32/ebrowser.c b/dlls/shell32/ebrowser.c
+index 8ae09d441bb..8a8dd442171 100644
+--- a/dlls/shell32/ebrowser.c
++++ b/dlls/shell32/ebrowser.c
+@@ -547,6 +547,237 @@ static LRESULT navpane_splitter_endresize(ExplorerBrowserImpl *This, HWND hwnd,
+     return TRUE;
+ }
+ 
++/**************************************************************************
++ * GTK bookmarks → Favorites .lnk creation
++ */
++
++static void url_decode_inplace(char *str)
++{
++    char *src = str, *dst = str;
++    while (*src)
++    {
++        if (src[0] == '%' && isxdigit(src[1]) && isxdigit(src[2]))
++        {
++            unsigned int val;
++            sscanf(src + 1, "%02x", &val);
++            *dst++ = (char)val;
++            src += 3;
++        }
++        else
++        {
++            *dst++ = *src++;
++        }
++    }
++    *dst = 0;
++}
++
++static void sync_gtk_bookmarks_to_favorites(void)
++{
++#define MAX_BOOKMARKS 64
++    char username[128], bm_file[512], line[4096];
++    WCHAR fav_path[MAX_PATH], target[MAX_PATH];
++    WCHAR *expected_labels[MAX_BOOKMARKS];
++    WCHAR *expected_targets[MAX_BOOKMARKS];
++    int bm_count = 0;
++    FILE *f;
++    HRESULT hr;
++    DWORD size;
++    int i;
++
++    size = sizeof(username);
++    if (!GetUserNameA(username, &size))
++    {
++        TRACE("GetUserNameA failed\n");
++        return;
++    }
++
++    hr = SHGetFolderPathW(NULL, CSIDL_FAVORITES, NULL, 0, fav_path);
++    if (FAILED(hr))
++    {
++        TRACE("SHGetFolderPathW(FAVORITES) failed 0x%08lx\n", hr);
++        return;
++    }
++
++    snprintf(bm_file, sizeof(bm_file), "/home/%s/.config/gtk-3.0/bookmarks", username);
++    f = fopen(bm_file, "r");
++    if (!f)
++    {
++        TRACE("Could not open %s\n", bm_file);
++        return;
++    }
++
++    /* Phase 1: read all bookmarks and collect expected labels + targets */
++    while (bm_count < MAX_BOOKMARKS && fgets(line, sizeof(line), f))
++    {
++        char *space, *unix_path, *label;
++        WCHAR labelW[256], label_sanitized[256];
++        int len;
++
++        line[strcspn(line, "\r\n")] = 0;
++        if (!*line) continue;
++
++        space = strchr(line, ' ');
++        if (space)
++        {
++            *space = 0;
++            unix_path = line;
++            label = space + 1;
++        }
++        else
++        {
++            unix_path = line;
++            label = strrchr(unix_path, '/');
++            if (label) label++;
++            if (!label || !*label) label = unix_path;
++            if (strncmp(unix_path, "file://", 7) == 0 && strncmp(label, "file://", 7) == 0)
++                label = unix_path + 7;
++        }
++
++        if (strncmp(unix_path, "file://", 7) == 0)
++            unix_path += 7;
++        else
++            continue;
++
++        url_decode_inplace(unix_path);
++        MultiByteToWideChar(CP_UTF8, 0, unix_path, -1, target, MAX_PATH);
++        MultiByteToWideChar(CP_UTF8, 0, label, -1, labelW, ARRAY_SIZE(labelW));
++
++        len = 0;
++        for (i = 0; labelW[i] && len < (int)(ARRAY_SIZE(label_sanitized) - 1); i++)
++        {
++            if (labelW[i] != L'\\' && labelW[i] != L'/' && labelW[i] != L':' &&
++                labelW[i] != L'*' && labelW[i] != L'?' && labelW[i] != L'"' &&
++                labelW[i] != L'<' && labelW[i] != L'>' && labelW[i] != L'|')
++                label_sanitized[len++] = labelW[i];
++        }
++        label_sanitized[len] = 0;
++
++        expected_labels[bm_count] = SHAlloc((lstrlenW(label_sanitized) + 1) * sizeof(WCHAR));
++        expected_targets[bm_count] = SHAlloc((lstrlenW(target) + 1) * sizeof(WCHAR));
++        if (!expected_labels[bm_count] || !expected_targets[bm_count])
++        {
++            SHFree(expected_labels[bm_count]);
++            SHFree(expected_targets[bm_count]);
++            continue;
++        }
++        lstrcpyW(expected_labels[bm_count], label_sanitized);
++        lstrcpyW(expected_targets[bm_count], target);
++        bm_count++;
++    }
++    fclose(f);
++
++    /* Phase 2: delete stale .lnk files (only those created by us pointing to Z:\) */
++    {
++        WCHAR search_path[MAX_PATH];
++        HANDLE hFind;
++        WIN32_FIND_DATAW find_data;
++
++        swprintf(search_path, ARRAY_SIZE(search_path), L"%s\\*.lnk", fav_path);
++        hFind = FindFirstFileW(search_path, &find_data);
++        if (hFind != INVALID_HANDLE_VALUE)
++        {
++            do
++            {
++                WCHAR full_path[MAX_PATH];
++                int match = 0;
++
++                swprintf(full_path, ARRAY_SIZE(full_path), L"%s\\%s", fav_path, find_data.cFileName);
++
++                /* Check if this .lnk filename matches any current bookmark */
++                {
++                    WCHAR *dot = wcsrchr(find_data.cFileName, L'.');
++                    if (dot) *dot = 0;
++                    for (i = 0; i < bm_count; i++)
++                    {
++                        if (!lstrcmpiW(find_data.cFileName, expected_labels[i]))
++                        {
++                            match = 1;
++                            break;
++                        }
++                    }
++                    if (dot) *dot = L'.';
++                }
++
++                if (!match)
++                {
++                    /* Not in current bookmarks. Check if it's one of ours (target Z:\) */
++                    IShellLinkW *psl_check;
++                    hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
++                                           &IID_IShellLinkW, (void**)&psl_check);
++                    if (SUCCEEDED(hr))
++                    {
++                        IPersistFile *ppf_check;
++                        hr = IShellLinkW_QueryInterface(psl_check, &IID_IPersistFile, (void**)&ppf_check);
++                        if (SUCCEEDED(hr))
++                        {
++                            if (SUCCEEDED(IPersistFile_Load(ppf_check, full_path, 0)))
++                            {
++                                WCHAR chk_path[MAX_PATH];
++                                if (SUCCEEDED(IShellLinkW_GetPath(psl_check, chk_path, MAX_PATH, NULL, 0)))
++                                {
++                                    if (!wcsncmp(chk_path, L"Z:\\", 3))
++                                    {
++                                        DeleteFileW(full_path);
++                                        TRACE("Deleted stale bookmark .lnk: %s\n", debugstr_w(full_path));
++                                    }
++                                }
++                            }
++                            IPersistFile_Release(ppf_check);
++                        }
++                        IShellLinkW_Release(psl_check);
++                    }
++                }
++            } while (FindNextFileW(hFind, &find_data));
++            FindClose(hFind);
++        }
++    }
++
++    /* Phase 3: create/update .lnk files */
++    for (i = 0; i < bm_count; i++)
++    {
++        WCHAR label_sanitized[MAX_PATH], lnk_path[MAX_PATH];
++        IShellLinkW *psl;
++        IPersistFile *ppf;
++
++        lstrcpyW(label_sanitized, expected_labels[i]);
++        swprintf(lnk_path, ARRAY_SIZE(lnk_path), L"%s\\%s.lnk", fav_path, label_sanitized);
++
++        hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
++                               &IID_IShellLinkW, (void**)&psl);
++        if (FAILED(hr)) continue;
++
++        {
++            WCHAR target_full[MAX_PATH + 10], *p2;
++            LPITEMIDLIST pidl;
++            swprintf(target_full, ARRAY_SIZE(target_full), L"Z:%s", expected_targets[i]);
++            for (p2 = target_full; *p2; p2++) if (*p2 == L'/') *p2 = L'\\';
++            pidl = ILCreateFromPathW(target_full);
++            if (pidl)
++            {
++                IShellLinkW_SetIDList(psl, pidl);
++                ILFree(pidl);
++            }
++            IShellLinkW_SetPath(psl, target_full);
++        }
++
++        hr = IShellLinkW_QueryInterface(psl, &IID_IPersistFile, (void**)&ppf);
++        if (SUCCEEDED(hr))
++        {
++            IPersistFile_Save(ppf, lnk_path, TRUE);
++            IPersistFile_Release(ppf);
++        }
++        IShellLinkW_Release(psl);
++    }
++
++    /* Phase 4: clean up */
++    for (i = 0; i < bm_count; i++)
++    {
++        SHFree(expected_labels[i]);
++        SHFree(expected_targets[i]);
++    }
++#undef MAX_BOOKMARKS
++}
++
+ static LRESULT navpane_on_wm_create(HWND hwnd, CREATESTRUCTW *crs)
+ {
+     ExplorerBrowserImpl *This = crs->lpCreateParams;
+@@ -596,6 +827,9 @@ static LRESULT navpane_on_wm_create(HWND hwnd, CREATESTRUCTW *crs)
+              * Add the default roots
+              */
+ 
++            /* Sync GTK bookmarks to Favorites folder (.lnk files for file view pane) */
++            sync_gtk_bookmarks_to_favorites();
++
+             /* TODO: This should be FOLDERID_Links */
+             hr = SHGetSpecialFolderLocation(NULL, CSIDL_FAVORITES, &pidl);
+             if(SUCCEEDED(hr))
+@@ -609,6 +843,52 @@ static LRESULT navpane_on_wm_create(HWND hwnd, CREATESTRUCTW *crs)
+                 ILFree(pidl);
+             }
+ 
++            /* Add GTK bookmarks as direct tree roots for inline navigation */
++            {
++                char bm_file[512], line[4096];
++                const char *home = getenv("HOME");
++                if (home)
++                {
++                    snprintf(bm_file, sizeof(bm_file), "%s/.config/gtk-3.0/bookmarks", home);
++                    {
++                        FILE *bf = fopen(bm_file, "r");
++                        if (bf)
++                    {
++                        while (fgets(line, sizeof(line), bf))
++                        {
++                            char *uri = line, *sep = strchr(line, ' ');
++                            WCHAR win_path[MAX_PATH], target_w[MAX_PATH], *p;
++                            IShellItem *bm_psi;
++
++                            line[strcspn(line, "\r\n")] = 0;
++                            if (!sep || !line[0]) continue;
++                            *sep = 0;
++                            /* strip file:// prefix if present */
++                            if (!strncmp(uri, "file://", 7))
++                                uri += 7;
++
++                            mbstowcs(target_w, uri, MAX_PATH);
++                            target_w[MAX_PATH-1] = 0;
++
++                            swprintf(win_path, ARRAY_SIZE(win_path),
++                                 L"Z:%s", target_w);
++                            for (p = win_path; *p; p++)
++                                if (*p == L'/') *p = L'\\';
++
++                            if (SUCCEEDED(SHCreateItemFromParsingName(win_path, NULL,
++                                    &IID_IShellItem, (void**)&bm_psi)))
++                            {
++                                INameSpaceTreeControl2_AppendRoot(pnstc2, bm_psi,
++                                    SHCONTF_FOLDERS, NSTCRS_VISIBLE, NULL);
++                                IShellItem_Release(bm_psi);
++                            }
++                        }
++                        fclose(bf);
++                        }
++                    }
++                }
++            }
++
+             SHGetDesktopFolder(&psfdesktop);
+             hr = SHGetItemFromObject((IUnknown*)psfdesktop, &IID_IShellItem, (void**)&psi);
+             IShellFolder_Release(psfdesktop);
+@@ -1179,6 +1459,41 @@ static HRESULT WINAPI IExplorerBrowser_fnBrowseToIDList(IExplorerBrowser *iface,
+         if(SUCCEEDED(hr))
+         {
+             hr = create_new_shellview(This, psi);
++            /* If it failed, try resolving as .lnk shortcut */
++            if (FAILED(hr))
++            {
++                LPITEMIDLIST lnk_pidl;
++                if (SUCCEEDED(SHGetIDListFromObject((IUnknown*)psi, &lnk_pidl)))
++                {
++                    IShellLinkW *psl;
++                    if (SUCCEEDED(IShellLink_ConstructFromFile(NULL, &IID_IShellLinkW, lnk_pidl, (IUnknown**)&psl)))
++                    {
++                        LPITEMIDLIST target = NULL;
++                        WCHAR path[MAX_PATH];
++                        if (SUCCEEDED(IShellLinkW_GetPath(psl, path, MAX_PATH, NULL, 0)))
++                            target = ILCreateFromPathW(path);
++                        if (!target)
++                            IShellLinkW_GetIDList(psl, &target);
++                        IShellLinkW_Release(psl);
++                        if (target)
++                        {
++                            IShellItem *target_psi;
++                            if (SUCCEEDED(SHCreateItemFromIDList(target, &IID_IShellItem, (void**)&target_psi)))
++                            {
++                                IShellItem_Release(psi);
++                                psi = target_psi;
++                                ILFree(absolute_pidl);
++                                absolute_pidl = ILClone(target);
++                                ILFree(target);
++                                hr = create_new_shellview(This, psi);
++                            }
++                            else
++                                ILFree(target);
++                        }
++                    }
++                    ILFree(lnk_pidl);
++                }
++            }
+             if(FAILED(hr))
+             {
+                 events_NavigationFailed(This, absolute_pidl);
+@@ -1432,14 +1747,21 @@ static HRESULT WINAPI IShellBrowser_fnGetControlWindow(IShellBrowser *iface,
+ }
+ 
+ static HRESULT WINAPI IShellBrowser_fnSendControlMsg(IShellBrowser *iface,
+-                                                     UINT id, UINT uMsg,
+-                                                     WPARAM wParam, LPARAM lParam,
+-                                                     LRESULT *pret)
++                                                       UINT id, UINT uMsg,
++                                                       WPARAM wParam, LPARAM lParam,
++                                                       LRESULT *pret)
+ {
+     ExplorerBrowserImpl *This = impl_from_IShellBrowser(iface);
+-    FIXME("stub, %p (%d, %d, %Ix, %Ix, %p)\n", This, id, uMsg, wParam, lParam, pret);
++    TRACE("%p (%d, %d, %Ix, %Ix, %p)\n", This, id, uMsg, wParam, lParam, pret);
+ 
+-    return E_NOTIMPL;
++    if (This->psv)
++    {
++        IShellView *psv = This->psv;
++        IShellView_AddRef(psv);
++        IShellView_Release(psv);
++    }
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI IShellBrowser_fnQueryActiveShellView(IShellBrowser *iface,
+@@ -1458,12 +1780,19 @@ static HRESULT WINAPI IShellBrowser_fnQueryActiveShellView(IShellBrowser *iface,
+ }
+ 
+ static HRESULT WINAPI IShellBrowser_fnOnViewWindowActive(IShellBrowser *iface,
+-                                                         IShellView *pshv)
++                                                          IShellView *pshv)
+ {
+     ExplorerBrowserImpl *This = impl_from_IShellBrowser(iface);
+-    FIXME("stub, %p (%p)\n", This, pshv);
++    TRACE("%p (%p)\n", This, pshv);
+ 
+-    return E_NOTIMPL;
++    if (This->psv)
++        IShellView_Release(This->psv);
++
++    This->psv = pshv;
++    if (This->psv)
++        IShellView_AddRef(This->psv);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI IShellBrowser_fnSetToolbarItems(IShellBrowser *iface,
+@@ -1556,6 +1885,7 @@ static HRESULT WINAPI ICommDlgBrowser3_fnOnDefaultCommand(ICommDlgBrowser3 *ifac
+         if(SUCCEEDED(hr))
+         {
+             LPIDA pida = GlobalLock(medium.hGlobal);
++            LPCITEMIDLIST pidl_parent = (LPCITEMIDLIST)((LPBYTE)pida + pida->aoffset[0]);
+             LPCITEMIDLIST pidl_child = (LPCITEMIDLIST) ((LPBYTE)pida+pida->aoffset[1]);
+ 
+             /* Handle folders by browsing to them. */
+@@ -1564,6 +1894,55 @@ static HRESULT WINAPI ICommDlgBrowser3_fnOnDefaultCommand(ICommDlgBrowser3 *ifac
+                 IExplorerBrowser_BrowseToIDList(&This->IExplorerBrowser_iface, pidl_child, SBSP_RELATIVE);
+                 ret = S_OK;
+             }
++            else
++            {
++                char ext[8];
++                if (_ILGetExtension(pidl_child, ext, sizeof(ext)) && !lstrcmpiA(ext, "lnk"))
++                {
++                    LPITEMIDLIST abs_pidl = ILCombine(pidl_parent, pidl_child);
++                    if (abs_pidl)
++                    {
++IShellLinkW *psl;
++                        TRACE(".lnk dblclick: resolving via ConstructFromFile\n");
++                        if (SUCCEEDED(IShellLink_ConstructFromFile(NULL, &IID_IShellLinkW, abs_pidl, (IUnknown**)&psl)))
++                        {
++                            WCHAR path[MAX_PATH];
++                            if (SUCCEEDED(IShellLinkW_GetPath(psl, path, MAX_PATH, NULL, 0)))
++                            {
++                                LPITEMIDLIST target_pidl3;
++                                TRACE(".lnk dblclick: target path=%s\n", debugstr_w(path));
++                                target_pidl3 = ILCreateFromPathW(path);
++                                TRACE(".lnk dblclick: ILCreateFromPathW -> %p\n", target_pidl3);
++                                if (target_pidl3)
++                                {
++                                    IExplorerBrowser_BrowseToIDList(&This->IExplorerBrowser_iface,
++                                        target_pidl3, SBSP_ABSOLUTE);
++                                    ILFree(target_pidl3);
++                                    IShellLinkW_Release(psl);
++                                    ret = S_OK;
++                                }
++                            }
++                            if (ret != S_OK)
++                            {
++                                LPITEMIDLIST target_pidl3;
++                                TRACE(".lnk dblclick: GetPath failed, trying GetIDList\n");
++                                if (SUCCEEDED(IShellLinkW_GetIDList(psl, &target_pidl3)) && target_pidl3)
++                                {
++                                    TRACE(".lnk dblclick: GetIDList pidl=%p\n", target_pidl3);
++                                    IExplorerBrowser_BrowseToIDList(&This->IExplorerBrowser_iface,
++                                        target_pidl3, SBSP_ABSOLUTE);
++                                    ILFree(target_pidl3);
++                                    IShellLinkW_Release(psl);
++                                    ret = S_OK;
++                                }
++                                else
++                                    IShellLinkW_Release(psl);
++                            }
++                        }
++                        ILFree(abs_pidl);
++                    }
++                }
++            }
+             GlobalUnlock(medium.hGlobal);
+             GlobalFree(medium.hGlobal);
+         }
+@@ -1845,7 +2224,7 @@ static HRESULT WINAPI NSTCEvents_fnOnItemStateChanged(INameSpaceTreeControlEvent
+ }
+ 
+ static HRESULT WINAPI NSTCEvents_fnOnSelectionChanged(INameSpaceTreeControlEvents *iface,
+-                                                      IShellItemArray *psiaSelection)
++                                                       IShellItemArray *psiaSelection)
+ {
+     ExplorerBrowserImpl *This = impl_from_INameSpaceTreeControlEvents(iface);
+     IShellItem *psi;
+@@ -1856,7 +2235,7 @@ static HRESULT WINAPI NSTCEvents_fnOnSelectionChanged(INameSpaceTreeControlEvent
+     if(SUCCEEDED(hr))
+     {
+         hr = IExplorerBrowser_BrowseToObject(&This->IExplorerBrowser_iface,
+-                                             (IUnknown*)psi, SBSP_DEFBROWSER);
++                                          (IUnknown*)psi, SBSP_DEFBROWSER);
+         IShellItem_Release(psi);
+     }
+ 
+@@ -2078,6 +2457,7 @@ HRESULT WINAPI ExplorerBrowser_Constructor(IUnknown *pUnkOuter, REFIID riid, voi
+ 
+     /* Default settings */
+     eb->navpane.show = TRUE;
++    eb->eb_options = EBO_SHOWFRAMES;
+ 
+     list_init(&eb->event_clients);
+     list_init(&eb->travellog);
+diff --git a/dlls/shell32/pidl.c b/dlls/shell32/pidl.c
+index 4cf052e3bda..3b185642848 100644
+--- a/dlls/shell32/pidl.c
++++ b/dlls/shell32/pidl.c
+@@ -1900,7 +1900,7 @@ BOOL _ILIsFolder(LPCITEMIDLIST pidl)
+ 
+     TRACE("(%p)\n",pidl);
+ 
+-    return (pidl && lpPData && (PT_FOLDER == lpPData->type || PT_FOLDER1 == lpPData->type));
++    return (pidl && lpPData && (PT_FOLDER == lpPData->type || PT_FOLDER1 == lpPData->type || PT_UNIXMOUNT == lpPData->type));
+ }
+ 
+ BOOL _ILIsValue(LPCITEMIDLIST pidl)
+@@ -2157,6 +2157,9 @@ static LPWSTR _ILGetTextPointerW(LPCITEMIDLIST pidl)
+ 
+     case PT_VALUEW:
+         return (LPWSTR)pdata->u.file.szNames;
++
++    case PT_UNIXMOUNT:
++        return (LPWSTR)((BYTE*)pdata + 1);
+     }
+     return NULL;
+ }
+diff --git a/dlls/shell32/pidl.h b/dlls/shell32/pidl.h
+index f7ce484657a..c2460da3c82 100644
+--- a/dlls/shell32/pidl.h
++++ b/dlls/shell32/pidl.h
+@@ -98,6 +98,7 @@
+ #define PT_VALUE	0x32
+ #define PT_VALUEW	0x34
+ #define PT_FOLDERW	0x35
++#define PT_UNIXMOUNT	0x36
+ #define PT_WORKGRP	0x41
+ #define PT_COMP		0x42
+ #define PT_NETPROVIDER	0x46
+diff --git a/dlls/shell32/shell32_main.c b/dlls/shell32/shell32_main.c
+index 3b342921088..565ab91d00d 100644
+--- a/dlls/shell32/shell32_main.c
++++ b/dlls/shell32/shell32_main.c
+@@ -1215,6 +1215,23 @@ HRESULT WINAPI SHQueryUserNotificationState(QUERY_USER_NOTIFICATION_STATE *state
+ HRESULT WINAPI SHCreateDataObject(PCIDLIST_ABSOLUTE pidl_folder, UINT count, PCUITEMID_CHILD_ARRAY pidl_array,
+                                   IDataObject *object, REFIID riid, void **ppv)
+ {
+-    FIXME("%p %d %p %p %s %p: stub\n", pidl_folder, count, pidl_array, object, debugstr_guid(riid), ppv);
+-    return E_NOTIMPL;
++    IDataObject *pDataObj;
++    HRESULT hr;
++
++    TRACE("(%p, %u, %p, %p, %s, %p)\n", pidl_folder, count, pidl_array, object, debugstr_guid(riid), ppv);
++
++    if (!ppv) return E_INVALIDARG;
++    *ppv = NULL;
++
++    if (object)
++        FIXME("delegate object not supported\n");
++
++    pDataObj = IDataObject_Constructor(NULL, pidl_folder, (const ITEMIDLIST **)pidl_array, count);
++    if (!pDataObj) return E_OUTOFMEMORY;
++
++    hr = IDataObject_QueryInterface(pDataObj, riid, ppv);
++    IDataObject_Release(pDataObj);
++
++    TRACE("returning %08lx, ppv=%p\n", hr, *ppv);
++    return hr;
+ }
+diff --git a/dlls/shell32/shfldr_desktop.c b/dlls/shell32/shfldr_desktop.c
+index 49de36aa741..9dfb2ff74ab 100644
+--- a/dlls/shell32/shfldr_desktop.c
++++ b/dlls/shell32/shfldr_desktop.c
+@@ -218,15 +218,17 @@ static HRESULT WINAPI ISF_Desktop_fnParseDisplayName (IShellFolder2 * iface,
+         {
+             if (*lpszDisplayName == '/')
+             {
+-                /* UNIX paths should be parsed by unixfs */
+-                IShellFolder *unixFS;
+-                hr = UnixFolder_Constructor(NULL, &IID_IShellFolder, (LPVOID*)&unixFS);
+-                if (SUCCEEDED(hr))
++                /* Convert /unix/path to \\?\unix\unix\path and route through existing
++                 * UnixDosFolder parsing, which correctly handles hierarchical PIDL creation. */
++                lstrcpynW(szElement, L"\\\\?\\unix", ARRAY_SIZE(szElement));
++                lstrcpynW(szElement + 8, lpszDisplayName, ARRAY_SIZE(szElement) - 8);
+                 {
+-                    hr = IShellFolder_ParseDisplayName(unixFS, NULL, NULL,
+-                            lpszDisplayName, NULL, &pidlTemp, NULL);
+-                    IShellFolder_Release(unixFS);
++                    LPWSTR p;
++                    for (p = szElement; *p; p++) if (*p == '/') *p = '\\';
+                 }
++                pidlTemp = _ILCreateGuid(PT_GUID, &CLSID_UnixDosFolder);
++                hr = S_OK;
++                szNext = szElement;
+             }
+             else
+             {
+@@ -246,20 +248,24 @@ static HRESULT WINAPI ISF_Desktop_fnParseDisplayName (IShellFolder2 * iface,
+                     /* should never reach here, but for completeness */
+                     hr = E_NOT_SUFFICIENT_BUFFER;
+                 }
++                szNext = NULL;
+             }
+         }
+         else
++        {
+             pidlTemp = _ILCreateMyComputer();
+-
+-        szNext = NULL;
++            szNext = NULL;
++        }
+     }
+ 
+     if (SUCCEEDED(hr) && pidlTemp)
+     {
+         if (szNext && *szNext)
+         {
++            WARN("[v12.7-STAGING] desktop ParseDisplayName: calling SHELL32_ParseNextElement szNext=%s pidlTemp=%p\n", debugstr_w(szNext), pidlTemp);
+             hr = SHELL32_ParseNextElement(iface, hwndOwner, pbc,
+                     &pidlTemp, (LPOLESTR) szNext, pchEaten, pdwAttributes);
++            WARN("[v12.7-STAGING] desktop ParseDisplayName: after SHELL32_ParseNextElement hr=0x%08lx pidlTemp=%p\n", hr, pidlTemp);
+         }
+         else
+         {
+diff --git a/dlls/shell32/shfldr_fs.c b/dlls/shell32/shfldr_fs.c
+index fabd27e984f..180d25cfd84 100644
+--- a/dlls/shell32/shfldr_fs.c
++++ b/dlls/shell32/shfldr_fs.c
+@@ -328,6 +328,9 @@ IShellFolder_fnParseDisplayName (IShellFolder2 * iface,
+         len = lstrlenW(szPath);
+         /* get the next element */
+         szNext = GetNextElementW( lpszDisplayName, szPath + len, MAX_PATH - len );
++        WARN("[v12.7-STAGING] fs ParseDisplayName: sPathTarget=%s lpszDisplayName=%s szPath=%s len=%lu szNext=%s\n",
++             debugstr_w(This->sPathTarget), debugstr_w(lpszDisplayName),
++             debugstr_w(szPath), len, debugstr_w(szNext));
+ 
+         if (IsEqualCLSID( This->pclsid, &CLSID_UnixFolder ) && lpszDisplayName[0] == '/')
+         {
+@@ -340,6 +343,8 @@ IShellFolder_fnParseDisplayName (IShellFolder2 * iface,
+             if ((p = wcschr( szPath + len, '\\' )))
+                 while (*p == '\\') *p++ = 0;
+             szNext = p;
++            WARN("[v12.7-STAGING] fs ParseDisplayName: unix path szPath=%s szNext=%s\n",
++                 debugstr_w(szPath), debugstr_w(szNext));
+         }
+ 
+         /* Special case for the root folder. */
+@@ -355,7 +360,9 @@ IShellFolder_fnParseDisplayName (IShellFolder2 * iface,
+ 
+         if (szNext && *szNext)
+         {
++            WARN("[v12.7-STAGING] fs ParseDisplayName: calling _ILCreateFromPathW szPath=%s\n", debugstr_w(szPath));
+             hr = _ILCreateFromPathW( szPath, &pidlTemp );
++            WARN("[v12.7-STAGING] fs ParseDisplayName: _ILCreateFromPathW hr=0x%08lx pidlTemp=%p\n", hr, pidlTemp);
+             if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && fsbd)
+             {
+                 find_data.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+@@ -363,8 +370,12 @@ IShellFolder_fnParseDisplayName (IShellFolder2 * iface,
+                 pidlTemp = _ILCreateFromFindDataW( &find_data );
+             }
+             if (pidlTemp) /* try to analyse the next element */
++            {
++                WARN("[v12.7-STAGING] fs ParseDisplayName: calling SHELL32_ParseNextElement pidlTemp=%p szNext=%s\n", pidlTemp, debugstr_w(szNext));
+                 hr = SHELL32_ParseNextElement( iface, hwndOwner, pbc, &pidlTemp,
+                                                (WCHAR *)szNext, pchEaten, pdwAttributes );
++                WARN("[v12.7-STAGING] fs ParseDisplayName: after SHELL32_ParseNextElement hr=0x%08lx pidlTemp=%p\n", hr, pidlTemp);
++            }
+         }
+         else  /* it's the last element */
+         {
+@@ -387,6 +398,15 @@ IShellFolder_fnParseDisplayName (IShellFolder2 * iface,
+     else
+         *ppidl = NULL;
+ 
++    /* Fallback: route bare Unix paths through SHParseDisplayName (desktop → MyComputer → Z:) */
++    if (FAILED(hr) && !*ppidl && lpszDisplayName && lpszDisplayName[0] == '/'
++            && !IsEqualCLSID(This->pclsid, &CLSID_UnixFolder))
++    {
++        WARN("[v12.7-STAGING] fs ParseDisplayName: fallback SHParseDisplayName for %s\n", debugstr_w(lpszDisplayName));
++        hr = SHParseDisplayName(lpszDisplayName, pbc, ppidl, 0, NULL);
++        WARN("[v12.7-STAGING] fs ParseDisplayName: fallback hr=0x%08lx ppidl=%p\n", hr, *ppidl);
++    }
++
+     TRACE ("(%p)->(-- pidl=%p ret=0x%08lx)\n", This, *ppidl, hr);
+ 
+     if (fsbd) IFileSystemBindData_Release( fsbd );
+@@ -1850,7 +1870,7 @@ HRESULT WINAPI UnixFolder_Constructor(IUnknown *outer_unk, REFIID riid, void **p
+ 
+ HRESULT WINAPI UnixDosFolder_Constructor(IUnknown *outer_unk, REFIID riid, void **ppv)
+ {
+-    return create_fs( outer_unk, riid, ppv, &CLSID_UnixDosFolder, NULL );
++    return create_fs( outer_unk, riid, ppv, &CLSID_UnixDosFolder, L"\\\\?\\unix\\" );
+ }
+ 
+ HRESULT WINAPI FolderShortcut_Constructor(IUnknown *outer_unk, REFIID riid, void **ppv)
+diff --git a/dlls/shell32/shfldr_mycomp.c b/dlls/shell32/shfldr_mycomp.c
+index 6d24a8e5c9e..eafec826fd2 100644
+--- a/dlls/shell32/shfldr_mycomp.c
++++ b/dlls/shell32/shfldr_mycomp.c
+@@ -39,6 +39,10 @@
+ #include "wine/debug.h"
+ #include "debughlp.h"
+ #include "shfldr.h"
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <io.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL (shell);
+ 
+@@ -272,6 +276,116 @@ static DWORD get_drive_map(void)
+     return GetLogicalDrives() & ~drive_mask;
+ }
+ 
++/**************************************************************************
++ * Unix mount points
++ */
++static LPITEMIDLIST create_unix_mount_pidl(const char *mount_point)
++{
++    WCHAR mountW[MAX_PATH], *name_start;
++    int name_len_bytes, path_len_bytes;
++    int mount_len;
++    LPITEMIDLIST pidl;
++
++    mount_len = MultiByteToWideChar(CP_UTF8, 0, mount_point, -1, mountW, MAX_PATH);
++    if (mount_len <= 0) return NULL;
++
++    name_start = wcsrchr(mountW, L'/');
++    if (!name_start) name_start = mountW;
++    else name_start++;
++
++    name_len_bytes = (lstrlenW(name_start) + 1) * sizeof(WCHAR);
++    path_len_bytes = mount_len * sizeof(WCHAR);
++
++    pidl = SHAlloc(offsetof(SHITEMID, abID) + 1 + name_len_bytes + path_len_bytes + sizeof(WORD));
++    if (!pidl) return NULL;
++
++    pidl->mkid.cb = sizeof(pidl->mkid.cb) + 1 + name_len_bytes + path_len_bytes;
++    pidl->mkid.abID[0] = PT_UNIXMOUNT;
++    memcpy(pidl->mkid.abID + 1, name_start, name_len_bytes);
++    memcpy(pidl->mkid.abID + 1 + name_len_bytes, mountW, path_len_bytes);
++
++    return pidl;
++}
++
++static BOOL add_unix_mount_point(IEnumIDListImpl *list, const char *mount_point)
++{
++    LPITEMIDLIST pidl = create_unix_mount_pidl(mount_point);
++
++    if (!pidl) return TRUE;
++    return AddToEnumList(list, pidl);
++}
++
++static int is_pseudo_fs(const char *fstype)
++{
++    static const char *pseudo_fses[] = {
++        "proc", "sysfs", "tmpfs", "devtmpfs", "devpts", "cgroup", "cgroup2",
++        "pstore", "securityfs", "hugetlbfs", "configfs", "efivarfs", "bpf",
++        "debugfs", "tracefs", "selinuxfs", "autofs", "overlay", "fuse.gvfsd-fuse",
++        "fuse.portal", "fuse.gvfsd-metadata", "rpc_pipefs", "sunrpc",
++        "mqueue", "cpuset", "nsfs", "squashfs", "iso9660", "udf",
++        "ramfs", "fusectl", "efivarfs", NULL
++    };
++    int i;
++    for (i = 0; pseudo_fses[i]; i++)
++        if (strcmp(fstype, pseudo_fses[i]) == 0) return 1;
++    return 0;
++}
++
++static int is_system_mount(const char *mount_point)
++{
++    if (strcmp(mount_point, "/") == 0) return 1;
++    if (strcmp(mount_point, "/boot") == 0) return 1;
++    if (strcmp(mount_point, "/boot/efi") == 0) return 1;
++    if (strncmp(mount_point, "/snap/", 6) == 0) return 1;
++    if (strncmp(mount_point, "/var/lib/snapd/", 15) == 0) return 1;
++    if (strncmp(mount_point, "/run/", 5) == 0) return 1;
++    if (strncmp(mount_point, "/sys/", 5) == 0) return 1;
++    if (strncmp(mount_point, "/proc/", 6) == 0) return 1;
++    if (strncmp(mount_point, "/dev/", 5) == 0) return 1;
++    return 0;
++}
++
++static int is_network_fs(const char *fstype)
++{
++    static const char *network[] = {
++        "cifs", "smbfs", "nfs", "nfs3", "nfs4", NULL
++    };
++    int i;
++    for (i = 0; network[i]; i++)
++        if (!strcmp(fstype, network[i])) return 1;
++    return 0;
++}
++
++static void enumerate_unix_mounts(IEnumIDListImpl *list)
++{
++    FILE *f = fopen("/proc/mounts", "r");
++    char line[4096];
++    int count = 0;
++
++    if (!f) return;
++
++    while (fgets(line, sizeof(line), f))
++    {
++char device[256], mount_point[4096], fstype[64], options[256];
++
++            if (sscanf(line, "%255s %4095s %63s %255s %*d %*d",
++                       device, mount_point, fstype, options) < 3)
++                continue;
++
++            if (is_pseudo_fs(fstype)) continue;
++            if (is_system_mount(mount_point)) continue;
++
++            if (!is_network_fs(fstype) && _access(mount_point, 0) != 0)
++                continue;
++
++        if (!add_unix_mount_point(list, mount_point))
++            break;
++        count++;
++    }
++    fclose(f);
++    TRACE("Added %d Linux mount points.\n", count);
++}
++
+ /**************************************************************************
+  *  CreateMyCompEnumList()
+  */
+@@ -297,6 +411,9 @@ static BOOL CreateMyCompEnumList(IEnumIDListImpl *list, DWORD dwFlags)
+             dwDrivemap = dwDrivemap >> 1;
+         }
+ 
++        /* Add Linux mount points */
++        enumerate_unix_mounts(list);
++
+         TRACE("-- (%p)-> enumerate (mycomputer shell extensions)\n",list);
+         for (i=0; i<2; i++) {
+             if (ret && !RegOpenKeyExW(i == 0 ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER,
+@@ -361,10 +478,82 @@ static HRESULT WINAPI ISF_MyComputer_fnBindToObject (IShellFolder2 *iface,
+                LPCITEMIDLIST pidl, LPBC pbcReserved, REFIID riid, LPVOID *ppvOut)
+ {
+     IMyComputerFolderImpl *This = impl_from_IShellFolder2(iface);
++    LPPIDLDATA pdata;
+ 
+     TRACE("(%p)->(pidl=%p,%p,%s,%p)\n", This,
+           pidl, pbcReserved, shdebugstr_guid (riid), ppvOut);
+ 
++    pdata = _ILGetDataPointer(pidl);
++    if (pdata && pdata->type == PT_UNIXMOUNT)
++    {
++        LPCWSTR basename = (LPCWSTR)((BYTE*)pdata + 1);
++        size_t name_bytes = (lstrlenW(basename) + 1) * sizeof(WCHAR);
++        LPWSTR mount_path = (LPWSTR)((BYTE*)pdata + 1 + name_bytes);
++        WCHAR win_path[MAX_PATH], *p;
++        HRESULT hr;
++
++        /* Convert /mount/point to Z:\mount\point */
++        swprintf(win_path, ARRAY_SIZE(win_path), L"Z:%s", mount_path);
++        for (p = win_path; *p; p++) if (*p == L'/') *p = L'\\';
++
++        {
++            /* Pre-check: verify mount still exists in /proc/mounts to avoid hanging */
++            char mount_utf8[MAX_PATH];
++            WideCharToMultiByte(CP_UTF8, 0, mount_path, -1, mount_utf8, MAX_PATH, NULL, NULL);
++            {
++                FILE *mf = fopen("/proc/mounts", "r");
++                int found = 0;
++                if (mf)
++                {
++                    char mline[4096];
++                    while (fgets(mline, sizeof(mline), mf))
++                    {
++                        char mp[4096];
++                        if (sscanf(mline, "%*s %4095s", mp) >= 1 &&
++                            !strcmp(mp, mount_utf8))
++                        {
++                            found = 1;
++                            break;
++                        }
++                    }
++                    fclose(mf);
++                }
++                if (!found)
++                {
++                    WARN("Unix mount %s no longer in /proc/mounts\n", mount_utf8);
++                    return HRESULT_FROM_WIN32(ERROR_NOT_READY);
++                }
++            }
++        }
++
++        {
++            LPITEMIDLIST abs_pidl = ILCreateFromPathW(win_path);
++            if (abs_pidl)
++            {
++                IShellFolder *psfParent, *psfMount;
++                LPCITEMIDLIST pidlChild;
++                hr = SHBindToParent(abs_pidl, &IID_IShellFolder, (void**)&psfParent, &pidlChild);
++                if (SUCCEEDED(hr))
++                {
++                    hr = IShellFolder_BindToObject(psfParent, pidlChild, NULL, &IID_IShellFolder, (void**)&psfMount);
++                    IShellFolder_Release(psfParent);
++                    if (SUCCEEDED(hr))
++                    {
++                        LPCITEMIDLIST remaining = ILGetNext(pidl);
++                        if (!_ILIsEmpty(remaining))
++                            hr = IShellFolder_BindToObject(psfMount, remaining, NULL, riid, ppvOut);
++                        else
++                            hr = IShellFolder_QueryInterface(psfMount, riid, ppvOut);
++                        IShellFolder_Release(psfMount);
++                    }
++                }
++                ILFree(abs_pidl);
++                return hr;
++            }
++        }
++        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
++    }
++
+     return SHELL32_BindToChild (This->pidlRoot, &CLSID_ShellFSFolder, NULL, pidl, riid, ppvOut);
+ }
+ 
+@@ -470,8 +659,11 @@ static HRESULT WINAPI ISF_MyComputer_fnGetAttributesOf (IShellFolder2 * iface,
+         }
+     } else {
+         while (cidl > 0 && *apidl) {
++            LPPIDLDATA pdata = _ILGetDataPointer(*apidl);
+             pdump (*apidl);
+             SHELL32_GetItemAttributes(&This->IShellFolder2_iface, *apidl, rgfInOut);
++            if (pdata && pdata->type == PT_UNIXMOUNT)
++                *rgfInOut |= SFGAO_FOLDER | SFGAO_FILESYSTEM | SFGAO_CANLINK | SFGAO_HASSUBFOLDER | SFGAO_BROWSABLE;
+             apidl++;
+             cidl--;
+         }
+@@ -681,12 +873,20 @@ static HRESULT WINAPI ISF_MyComputer_fnGetDisplayNameOf (IShellFolder2 *iface,
+                 lstrcpyW (pszPath, wszDrive);
+             }
+         }
+-        else 
++        else
+         {
+-            /* Neither a shell namespace extension nor a drive letter. */
+-            ERR("Wrong pidl type\n");
+-            CoTaskMemFree(pszPath);
+-            return E_INVALIDARG;
++            LPPIDLDATA pdata = _ILGetDataPointer(pidl);
++            if (pdata && pdata->type == PT_UNIXMOUNT)
++            {
++                _ILSimpleGetTextW(pidl, pszPath, MAX_PATH);
++            }
++            else
++            {
++                /* Neither a shell namespace extension nor a drive letter. */
++                ERR("Wrong pidl type\n");
++                CoTaskMemFree(pszPath);
++                return E_INVALIDARG;
++            }
+         }
+     }
+     else
+diff --git a/dlls/shell32/shlexec.c b/dlls/shell32/shlexec.c
+index d2a6d5700d4..8a9768e9a8e 100644
+--- a/dlls/shell32/shlexec.c
++++ b/dlls/shell32/shlexec.c
+@@ -1890,6 +1890,71 @@ static BOOL SHELL_execute( LPSHELLEXECUTEINFOW sei, SHELL_ExecuteW32 execfunc )
+     retval = SHELL_FindExecutable(sei_tmp.lpDirectory, lpFile, sei_tmp.lpVerb, wcmd, wcmdLen, wszKeyname, &env, sei_tmp.lpIDList, sei_tmp.lpParameters);
+     if (retval > 32)  /* Found */
+     {
++        /* Native file manager: intercept explorer.exe /select */
++        {
++            static BOOL checked = FALSE;
++            static BOOL use_native = TRUE;
++            UINT j;
++            if (!checked)
++            {
++                const char *env2 = getenv("WINE_NATIVE_FILE_MANAGER");
++                if (env2 && (!strcmp(env2, "0") || !strcmp(env2, "false")))
++                    use_native = FALSE;
++                checked = TRUE;
++            }
++            if (use_native && wcsstr(wszParameters, L"/select")
++                && (wcsstr(lpFile, L"explorer") || wcsstr(wszKeyname, L"explorer")))
++            {
++                WCHAR *sel = wcsstr(wszParameters, L"/select,");
++                if (!sel) sel = wcsstr(wszParameters, L"/SELECT,");
++                if (sel)
++                {
++                    WCHAR path[MAX_PATH], *start = sel + 8;
++                    while (*start == L' ' || *start == L'\t') start++;
++                    if (*start == L'"')
++                    {
++                        for (j = 0; j < MAX_PATH - 1 && start[j + 1] && start[j + 1] != L'"'; j++)
++                            path[j] = start[j + 1];
++                        path[j] = L'\0';
++                    }
++                    else
++                    {
++                        for (j = 0; j < MAX_PATH - 1 && start[j] && start[j] != L' '; j++)
++                            path[j] = start[j];
++                        path[j] = L'\0';
++                    }
++                    if (path[0])
++                    {
++                        WCHAR exe[MAX_PATH], cl[4096];
++                        WCHAR parent[MAX_PATH];
++                        lstrcpyW(parent, path);
++                        WCHAR *bs = wcsrchr(parent, L'\\');
++                        if (bs) *bs = L'\0';
++                        GetSystemDirectoryW(exe, MAX_PATH);
++                        lstrcatW(exe, L"\\wineopenfolder.exe");
++                        lstrcpyW(cl, L"\"");
++                        lstrcatW(cl, exe);
++                        lstrcatW(cl, L"\" \"");
++                        lstrcatW(cl, parent);
++                        lstrcatW(cl, L"\" --select \"");
++                        lstrcatW(cl, path);
++                        lstrcatW(cl, L"\"");
++                        STARTUPINFOW si;
++                        PROCESS_INFORMATION pi;
++                        memset(&si, 0, sizeof(si));
++                        si.cb = sizeof(si);
++                        if (CreateProcessW(exe, cl, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
++                        {
++                            CloseHandle(pi.hThread);
++                            CloseHandle(pi.hProcess);
++                            free(env);
++                            retval = 33;
++                            goto end;
++                        }
++                    }
++                }
++            }
++        }
+         retval = SHELL_quote_and_execute( wcmd, wszParameters, wszKeyname,
+                                           wszApplicationName, env, &sei_tmp,
+                                           sei, execfunc );
+diff --git a/dlls/shell32/shlfolder.c b/dlls/shell32/shlfolder.c
+index 492116c43f2..00ee5df2c79 100644
+--- a/dlls/shell32/shlfolder.c
++++ b/dlls/shell32/shlfolder.c
+@@ -659,6 +659,105 @@ HRESULT WINAPI SHOpenFolderAndSelectItems(PCIDLIST_ABSOLUTE pidlFolder, UINT cid
+     if (flags & OFASI_EDIT && cidl > 1)
+         flags &= ~OFASI_EDIT;
+ 
++    /* Native file manager support (xdg-open / nautilus)
++     * Controlled by WINE_NATIVE_FILE_MANAGER env var (default enabled, set to "0" to disable) */
++    {
++        static BOOL checked = FALSE;
++        static BOOL use_native = TRUE;
++        WCHAR folder_path[MAX_PATH];
++        WCHAR exe_path[MAX_PATH], cmdline[4096];
++        STARTUPINFOW si;
++        PROCESS_INFORMATION pi;
++
++        if (!checked)
++        {
++            const char *env = getenv("WINE_NATIVE_FILE_MANAGER");
++            if (env && (!strcmp(env, "0") || !strcmp(env, "false")))
++                use_native = FALSE;
++            checked = TRUE;
++        }
++
++        if (use_native)
++        {
++            BOOL got_path = FALSE;
++
++            if (cidl > 0)
++            {
++                got_path = SHGetPathFromIDListW(pidlFolder, folder_path);
++            }
++            else
++            {
++                LPITEMIDLIST parent = ILClone(pidlFolder);
++                if (parent)
++                {
++                    ILRemoveLastID(parent);
++                    got_path = SHGetPathFromIDListW(parent, folder_path);
++                    ILFree(parent);
++                }
++            }
++
++            if (got_path)
++            {
++                GetSystemDirectoryW(exe_path, MAX_PATH);
++                lstrcatW(exe_path, L"\\wineopenfolder.exe");
++
++                lstrcpyW(cmdline, L"\"");
++                lstrcatW(cmdline, exe_path);
++                lstrcatW(cmdline, L"\" \"");
++                lstrcatW(cmdline, folder_path);
++                lstrcatW(cmdline, L"\"");
++
++                if (cidl > 0)
++                {
++                    unsigned int j;
++                    for (j = 0; j < cidl; j++)
++                    {
++                        LPITEMIDLIST full_child = ILCombine(pidlFolder, apidl[j]);
++                        if (full_child)
++                        {
++                            WCHAR child_path[MAX_PATH];
++                            if (SHGetPathFromIDListW(full_child, child_path))
++                            {
++                                lstrcatW(cmdline, L" --select \"");
++                                lstrcatW(cmdline, child_path);
++                                lstrcatW(cmdline, L"\"");
++                            }
++                            ILFree(full_child);
++                        }
++                    }
++                }
++                else
++                {
++                    LPITEMIDLIST child = ILClone(pidlFolder);
++                    if (child)
++                    {
++                        WCHAR child_path[MAX_PATH];
++                        if (SHGetPathFromIDListW(child, child_path))
++                        {
++                            lstrcatW(cmdline, L" --select \"");
++                            lstrcatW(cmdline, child_path);
++                            lstrcatW(cmdline, L"\"");
++                        }
++                        ILFree(child);
++                    }
++                }
++
++                TRACE("Launching native file manager: %s\n", wine_dbgstr_w(cmdline));
++
++                memset(&si, 0, sizeof(si));
++                si.cb = sizeof(si);
++                if (CreateProcessW(exe_path, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
++                {
++                    CloseHandle(pi.hThread);
++                    CloseHandle(pi.hProcess);
++                    return S_OK;
++                }
++                WARN("Failed to launch wineopenfolder.exe (error %lu), falling back to built-in\n",
++                     GetLastError());
++            }
++        }
++    }
++
+     hr = CoCreateInstance(&CLSID_ShellWindows, NULL, CLSCTX_LOCAL_SERVER, &IID_IShellWindows,
+                           (void **)&sw);
+     if (FAILED(hr))
+diff --git a/dlls/shell32/shlview.c b/dlls/shell32/shlview.c
+index b1524b1f29f..52150e9146d 100644
+--- a/dlls/shell32/shlview.c
++++ b/dlls/shell32/shlview.c
+@@ -335,6 +335,7 @@ static DWORD ViewModeToListStyle(UINT ViewMode)
+ 	  case FVM_DETAILS:	dwStyle = LVS_REPORT;		break;
+ 	  case FVM_SMALLICON:	dwStyle = LVS_SMALLICON;	break;
+ 	  case FVM_LIST:	dwStyle = LVS_LIST;		break;
++	  case FVM_AUTO:	dwStyle = LVS_LIST;		break;
+ 	  default:
+ 	  {
+ 		FIXME("ViewMode %d not implemented\n", ViewMode);
+diff --git a/dlls/shell32/x86_64-windows/libshell32.a b/dlls/shell32/x86_64-windows/libshell32.a
+index ec475d6067d..459f6a51a75 100644
+Binary files a/dlls/shell32/x86_64-windows/libshell32.a and b/dlls/shell32/x86_64-windows/libshell32.a differ
+diff --git a/programs/explorer/explorer.c b/programs/explorer/explorer.c
+index 185414417c9..b14317c4215 100644
+--- a/programs/explorer/explorer.c
++++ b/programs/explorer/explorer.c
 @@ -25,6 +25,7 @@
  #include "wine/debug.h"
  #include "explorer_private.h"
@@ -1363,7 +2686,7 @@
  
  #include <initguid.h>
  #include <windows.h>
-@@ -924,6 +925,39 @@
+@@ -924,6 +925,39 @@ int WINAPI wWinMain(HINSTANCE hinstance,
      memset(&parameters,0,sizeof(parameters));
      explorer_hInstance = hinstance;
      parse_command_line(cmdline,&parameters);
@@ -1403,8 +2726,23 @@
      hres = OleInitialize(NULL);
      if(FAILED(hres))
      {
---- /dev/null	2026-07-08 08:29:57.068065991 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/programs/winefiledialog/main.c	2026-05-18 20:03:38.395172380 +0900
+diff --git a/programs/winefiledialog/Makefile.in b/programs/winefiledialog/Makefile.in
+new file mode 100644
+index 00000000000..86d2525ca60
+--- /dev/null
++++ b/programs/winefiledialog/Makefile.in
+@@ -0,0 +1,6 @@
++MODULE    = winefiledialog.exe
++IMPORTS   = kernel32 ntdll
++EXTRADLLFLAGS = -mwindows -municode
++
++SOURCES = \
++	main.c
+diff --git a/programs/winefiledialog/main.c b/programs/winefiledialog/main.c
+new file mode 100644
+index 00000000000..0bef026a96c
+--- /dev/null
++++ b/programs/winefiledialog/main.c
 @@ -0,0 +1,245 @@
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -1651,8 +2989,24 @@
 +        return 1;
 +    }
 +}
---- /dev/null	2026-07-08 08:29:57.068065991 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/programs/wineopenfolder/main.c	2026-05-20 20:41:26.370003727 +0900
+diff --git a/programs/wineopenfolder/Makefile.in b/programs/wineopenfolder/Makefile.in
+new file mode 100644
+index 00000000000..d7f2b21c7ae
+--- /dev/null
++++ b/programs/wineopenfolder/Makefile.in
+@@ -0,0 +1,6 @@
++MODULE    = wineopenfolder.exe
++IMPORTS   = kernel32 ntdll
++EXTRADLLFLAGS = -mwindows -municode
++
++SOURCES = \
++	main.c
+\ No newline at end of file
+diff --git a/programs/wineopenfolder/main.c b/programs/wineopenfolder/main.c
+new file mode 100644
+index 00000000000..f7d1e864625
+--- /dev/null
++++ b/programs/wineopenfolder/main.c
 @@ -0,0 +1,68 @@
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -1722,1288 +3076,4 @@
 +    HeapFree(GetProcessHeap(), 0, unix_folder);
 +    return 1;
 +}
-\ ファイル末尾に改行がありません
---- /tmp/orig/dlls/shell32/clipboard.c	2026-07-10 20:08:12.437959535 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/clipboard.c	2026-06-06 08:32:28.775862431 +0900
-@@ -159,6 +159,9 @@
- 
- 	TRACE("(%p,%p,%u)\n", pidlRoot, apidl, cidl);
- 
-+	if (!apidl || !cidl || !apidl[0])
-+		return 0;
-+
- 	/* get path of combined pidl */
- 	pidl = ILCombine(pidlRoot, apidl[0]);
- 	if (!pidl)
-@@ -191,6 +194,9 @@
- 
- 	TRACE("(%p,%p,%u)\n", pidlRoot, apidl, cidl);
- 
-+	if (!apidl || !cidl || !apidl[0])
-+		return 0;
-+
- 	/* get path of combined pidl */
- 	pidl = ILCombine(pidlRoot, apidl[0]);
- 	if (!pidl)
---- /tmp/orig/dlls/shell32/dataobject.c	2026-07-10 20:08:12.513161068 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/dataobject.c	2026-06-06 08:28:13.199449899 +0900
-@@ -458,16 +458,20 @@
- 
-     obj->ref = 1;
-     obj->IDataObject_iface.lpVtbl = &dtovt;
--    obj->data = calloc(4, sizeof(*obj->data));
--    obj->data[0].cf = RegisterClipboardFormatW(CFSTR_SHELLIDLISTW);
--    obj->data[0].global = RenderSHELLIDLIST(root_pidl, pidls, pidl_count);
--    obj->data[1].cf = CF_HDROP;
--    obj->data[1].global = RenderHDROP(root_pidl, pidls, pidl_count);
--    obj->data[2].cf = RegisterClipboardFormatA(CFSTR_FILENAMEA);
--    obj->data[2].global = RenderFILENAMEA(root_pidl, pidls, pidl_count);
--    obj->data[3].cf = RegisterClipboardFormatW(CFSTR_FILENAMEW);
--    obj->data[3].global = RenderFILENAMEW(root_pidl, pidls, pidl_count);
--    obj->data_count = 4;
-+
-+    if (pidl_count && pidls)
-+    {
-+        obj->data = calloc(4, sizeof(*obj->data));
-+        obj->data[0].cf = RegisterClipboardFormatW(CFSTR_SHELLIDLISTW);
-+        obj->data[0].global = RenderSHELLIDLIST(root_pidl, pidls, pidl_count);
-+        obj->data[1].cf = CF_HDROP;
-+        obj->data[1].global = RenderHDROP(root_pidl, pidls, pidl_count);
-+        obj->data[2].cf = RegisterClipboardFormatA(CFSTR_FILENAMEA);
-+        obj->data[2].global = RenderFILENAMEA(root_pidl, pidls, pidl_count);
-+        obj->data[3].cf = RegisterClipboardFormatW(CFSTR_FILENAMEW);
-+        obj->data[3].global = RenderFILENAMEW(root_pidl, pidls, pidl_count);
-+        obj->data_count = 4;
-+    }
- 
-     TRACE("Created data object %p.\n", obj);
-     return &obj->IDataObject_iface;
---- /tmp/orig/dlls/shell32/debughlp.c	2026-07-10 20:08:12.922156490 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/debughlp.c	2026-05-23 16:29:22.909873175 +0900
-@@ -373,9 +373,10 @@
-         case PT_IESPECIAL1:
-         case PT_YAGUID:
-         case PT_IESPECIAL2:
--        case PT_SHARE:
--            break;
--        default:
-+case PT_SHARE:
-+         case PT_UNIXMOUNT:
-+             break;
-+         default:
-             ERR("unknown IDLIST %p [%p] size=%u type=%lx\n",
-                 pidl, pidltemp, pidltemp->mkid.cb,type );
-             dump_pidl_hex( pidltemp );
---- /tmp/orig/dlls/shell32/ebrowser.c	2026-07-10 20:08:12.819157643 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/ebrowser.c	2026-06-06 08:23:06.738697598 +0900
-@@ -547,6 +547,237 @@
-     return TRUE;
- }
- 
-+/**************************************************************************
-+ * GTK bookmarks → Favorites .lnk creation
-+ */
-+
-+static void url_decode_inplace(char *str)
-+{
-+    char *src = str, *dst = str;
-+    while (*src)
-+    {
-+        if (src[0] == '%' && isxdigit(src[1]) && isxdigit(src[2]))
-+        {
-+            unsigned int val;
-+            sscanf(src + 1, "%02x", &val);
-+            *dst++ = (char)val;
-+            src += 3;
-+        }
-+        else
-+        {
-+            *dst++ = *src++;
-+        }
-+    }
-+    *dst = 0;
-+}
-+
-+static void sync_gtk_bookmarks_to_favorites(void)
-+{
-+#define MAX_BOOKMARKS 64
-+    char username[128], bm_file[512], line[4096];
-+    WCHAR fav_path[MAX_PATH], target[MAX_PATH];
-+    WCHAR *expected_labels[MAX_BOOKMARKS];
-+    WCHAR *expected_targets[MAX_BOOKMARKS];
-+    int bm_count = 0;
-+    FILE *f;
-+    HRESULT hr;
-+    DWORD size;
-+    int i;
-+
-+    size = sizeof(username);
-+    if (!GetUserNameA(username, &size))
-+    {
-+        TRACE("GetUserNameA failed\n");
-+        return;
-+    }
-+
-+    hr = SHGetFolderPathW(NULL, CSIDL_FAVORITES, NULL, 0, fav_path);
-+    if (FAILED(hr))
-+    {
-+        TRACE("SHGetFolderPathW(FAVORITES) failed 0x%08lx\n", hr);
-+        return;
-+    }
-+
-+    snprintf(bm_file, sizeof(bm_file), "/home/%s/.config/gtk-3.0/bookmarks", username);
-+    f = fopen(bm_file, "r");
-+    if (!f)
-+    {
-+        TRACE("Could not open %s\n", bm_file);
-+        return;
-+    }
-+
-+    /* Phase 1: read all bookmarks and collect expected labels + targets */
-+    while (bm_count < MAX_BOOKMARKS && fgets(line, sizeof(line), f))
-+    {
-+        char *space, *unix_path, *label;
-+        WCHAR labelW[256], label_sanitized[256];
-+        int len;
-+
-+        line[strcspn(line, "\r\n")] = 0;
-+        if (!*line) continue;
-+
-+        space = strchr(line, ' ');
-+        if (space)
-+        {
-+            *space = 0;
-+            unix_path = line;
-+            label = space + 1;
-+        }
-+        else
-+        {
-+            unix_path = line;
-+            label = strrchr(unix_path, '/');
-+            if (label) label++;
-+            if (!label || !*label) label = unix_path;
-+            if (strncmp(unix_path, "file://", 7) == 0 && strncmp(label, "file://", 7) == 0)
-+                label = unix_path + 7;
-+        }
-+
-+        if (strncmp(unix_path, "file://", 7) == 0)
-+            unix_path += 7;
-+        else
-+            continue;
-+
-+        url_decode_inplace(unix_path);
-+        MultiByteToWideChar(CP_UTF8, 0, unix_path, -1, target, MAX_PATH);
-+        MultiByteToWideChar(CP_UTF8, 0, label, -1, labelW, ARRAY_SIZE(labelW));
-+
-+        len = 0;
-+        for (i = 0; labelW[i] && len < (int)(ARRAY_SIZE(label_sanitized) - 1); i++)
-+        {
-+            if (labelW[i] != L'\\' && labelW[i] != L'/' && labelW[i] != L':' &&
-+                labelW[i] != L'*' && labelW[i] != L'?' && labelW[i] != L'"' &&
-+                labelW[i] != L'<' && labelW[i] != L'>' && labelW[i] != L'|')
-+                label_sanitized[len++] = labelW[i];
-+        }
-+        label_sanitized[len] = 0;
-+
-+        expected_labels[bm_count] = SHAlloc((lstrlenW(label_sanitized) + 1) * sizeof(WCHAR));
-+        expected_targets[bm_count] = SHAlloc((lstrlenW(target) + 1) * sizeof(WCHAR));
-+        if (!expected_labels[bm_count] || !expected_targets[bm_count])
-+        {
-+            SHFree(expected_labels[bm_count]);
-+            SHFree(expected_targets[bm_count]);
-+            continue;
-+        }
-+        lstrcpyW(expected_labels[bm_count], label_sanitized);
-+        lstrcpyW(expected_targets[bm_count], target);
-+        bm_count++;
-+    }
-+    fclose(f);
-+
-+    /* Phase 2: delete stale .lnk files (only those created by us pointing to Z:\) */
-+    {
-+        WCHAR search_path[MAX_PATH];
-+        HANDLE hFind;
-+        WIN32_FIND_DATAW find_data;
-+
-+        swprintf(search_path, ARRAY_SIZE(search_path), L"%s\\*.lnk", fav_path);
-+        hFind = FindFirstFileW(search_path, &find_data);
-+        if (hFind != INVALID_HANDLE_VALUE)
-+        {
-+            do
-+            {
-+                WCHAR full_path[MAX_PATH];
-+                int match = 0;
-+
-+                swprintf(full_path, ARRAY_SIZE(full_path), L"%s\\%s", fav_path, find_data.cFileName);
-+
-+                /* Check if this .lnk filename matches any current bookmark */
-+                {
-+                    WCHAR *dot = wcsrchr(find_data.cFileName, L'.');
-+                    if (dot) *dot = 0;
-+                    for (i = 0; i < bm_count; i++)
-+                    {
-+                        if (!lstrcmpiW(find_data.cFileName, expected_labels[i]))
-+                        {
-+                            match = 1;
-+                            break;
-+                        }
-+                    }
-+                    if (dot) *dot = L'.';
-+                }
-+
-+                if (!match)
-+                {
-+                    /* Not in current bookmarks. Check if it's one of ours (target Z:\) */
-+                    IShellLinkW *psl_check;
-+                    hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
-+                                           &IID_IShellLinkW, (void**)&psl_check);
-+                    if (SUCCEEDED(hr))
-+                    {
-+                        IPersistFile *ppf_check;
-+                        hr = IShellLinkW_QueryInterface(psl_check, &IID_IPersistFile, (void**)&ppf_check);
-+                        if (SUCCEEDED(hr))
-+                        {
-+                            if (SUCCEEDED(IPersistFile_Load(ppf_check, full_path, 0)))
-+                            {
-+                                WCHAR chk_path[MAX_PATH];
-+                                if (SUCCEEDED(IShellLinkW_GetPath(psl_check, chk_path, MAX_PATH, NULL, 0)))
-+                                {
-+                                    if (!wcsncmp(chk_path, L"Z:\\", 3))
-+                                    {
-+                                        DeleteFileW(full_path);
-+                                        TRACE("Deleted stale bookmark .lnk: %s\n", debugstr_w(full_path));
-+                                    }
-+                                }
-+                            }
-+                            IPersistFile_Release(ppf_check);
-+                        }
-+                        IShellLinkW_Release(psl_check);
-+                    }
-+                }
-+            } while (FindNextFileW(hFind, &find_data));
-+            FindClose(hFind);
-+        }
-+    }
-+
-+    /* Phase 3: create/update .lnk files */
-+    for (i = 0; i < bm_count; i++)
-+    {
-+        WCHAR label_sanitized[MAX_PATH], lnk_path[MAX_PATH];
-+        IShellLinkW *psl;
-+        IPersistFile *ppf;
-+
-+        lstrcpyW(label_sanitized, expected_labels[i]);
-+        swprintf(lnk_path, ARRAY_SIZE(lnk_path), L"%s\\%s.lnk", fav_path, label_sanitized);
-+
-+        hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
-+                               &IID_IShellLinkW, (void**)&psl);
-+        if (FAILED(hr)) continue;
-+
-+        {
-+            WCHAR target_full[MAX_PATH + 10], *p2;
-+            LPITEMIDLIST pidl;
-+            swprintf(target_full, ARRAY_SIZE(target_full), L"Z:%s", expected_targets[i]);
-+            for (p2 = target_full; *p2; p2++) if (*p2 == L'/') *p2 = L'\\';
-+            pidl = ILCreateFromPathW(target_full);
-+            if (pidl)
-+            {
-+                IShellLinkW_SetIDList(psl, pidl);
-+                ILFree(pidl);
-+            }
-+            IShellLinkW_SetPath(psl, target_full);
-+        }
-+
-+        hr = IShellLinkW_QueryInterface(psl, &IID_IPersistFile, (void**)&ppf);
-+        if (SUCCEEDED(hr))
-+        {
-+            IPersistFile_Save(ppf, lnk_path, TRUE);
-+            IPersistFile_Release(ppf);
-+        }
-+        IShellLinkW_Release(psl);
-+    }
-+
-+    /* Phase 4: clean up */
-+    for (i = 0; i < bm_count; i++)
-+    {
-+        SHFree(expected_labels[i]);
-+        SHFree(expected_targets[i]);
-+    }
-+#undef MAX_BOOKMARKS
-+}
-+
- static LRESULT navpane_on_wm_create(HWND hwnd, CREATESTRUCTW *crs)
- {
-     ExplorerBrowserImpl *This = crs->lpCreateParams;
-@@ -596,6 +827,9 @@
-              * Add the default roots
-              */
- 
-+            /* Sync GTK bookmarks to Favorites folder (.lnk files for file view pane) */
-+            sync_gtk_bookmarks_to_favorites();
-+
-             /* TODO: This should be FOLDERID_Links */
-             hr = SHGetSpecialFolderLocation(NULL, CSIDL_FAVORITES, &pidl);
-             if(SUCCEEDED(hr))
-@@ -609,6 +843,52 @@
-                 ILFree(pidl);
-             }
- 
-+            /* Add GTK bookmarks as direct tree roots for inline navigation */
-+            {
-+                char bm_file[512], line[4096];
-+                const char *home = getenv("HOME");
-+                if (home)
-+                {
-+                    snprintf(bm_file, sizeof(bm_file), "%s/.config/gtk-3.0/bookmarks", home);
-+                    {
-+                        FILE *bf = fopen(bm_file, "r");
-+                        if (bf)
-+                    {
-+                        while (fgets(line, sizeof(line), bf))
-+                        {
-+                            char *uri = line, *sep = strchr(line, ' ');
-+                            WCHAR win_path[MAX_PATH], target_w[MAX_PATH], *p;
-+                            IShellItem *bm_psi;
-+
-+                            line[strcspn(line, "\r\n")] = 0;
-+                            if (!sep || !line[0]) continue;
-+                            *sep = 0;
-+                            /* strip file:// prefix if present */
-+                            if (!strncmp(uri, "file://", 7))
-+                                uri += 7;
-+
-+                            mbstowcs(target_w, uri, MAX_PATH);
-+                            target_w[MAX_PATH-1] = 0;
-+
-+                            swprintf(win_path, ARRAY_SIZE(win_path),
-+                                 L"Z:%s", target_w);
-+                            for (p = win_path; *p; p++)
-+                                if (*p == L'/') *p = L'\\';
-+
-+                            if (SUCCEEDED(SHCreateItemFromParsingName(win_path, NULL,
-+                                    &IID_IShellItem, (void**)&bm_psi)))
-+                            {
-+                                INameSpaceTreeControl2_AppendRoot(pnstc2, bm_psi,
-+                                    SHCONTF_FOLDERS, NSTCRS_VISIBLE, NULL);
-+                                IShellItem_Release(bm_psi);
-+                            }
-+                        }
-+                        fclose(bf);
-+                        }
-+                    }
-+                }
-+            }
-+
-             SHGetDesktopFolder(&psfdesktop);
-             hr = SHGetItemFromObject((IUnknown*)psfdesktop, &IID_IShellItem, (void**)&psi);
-             IShellFolder_Release(psfdesktop);
-@@ -1179,6 +1459,41 @@
-         if(SUCCEEDED(hr))
-         {
-             hr = create_new_shellview(This, psi);
-+            /* If it failed, try resolving as .lnk shortcut */
-+            if (FAILED(hr))
-+            {
-+                LPITEMIDLIST lnk_pidl;
-+                if (SUCCEEDED(SHGetIDListFromObject((IUnknown*)psi, &lnk_pidl)))
-+                {
-+                    IShellLinkW *psl;
-+                    if (SUCCEEDED(IShellLink_ConstructFromFile(NULL, &IID_IShellLinkW, lnk_pidl, (IUnknown**)&psl)))
-+                    {
-+                        LPITEMIDLIST target = NULL;
-+                        WCHAR path[MAX_PATH];
-+                        if (SUCCEEDED(IShellLinkW_GetPath(psl, path, MAX_PATH, NULL, 0)))
-+                            target = ILCreateFromPathW(path);
-+                        if (!target)
-+                            IShellLinkW_GetIDList(psl, &target);
-+                        IShellLinkW_Release(psl);
-+                        if (target)
-+                        {
-+                            IShellItem *target_psi;
-+                            if (SUCCEEDED(SHCreateItemFromIDList(target, &IID_IShellItem, (void**)&target_psi)))
-+                            {
-+                                IShellItem_Release(psi);
-+                                psi = target_psi;
-+                                ILFree(absolute_pidl);
-+                                absolute_pidl = ILClone(target);
-+                                ILFree(target);
-+                                hr = create_new_shellview(This, psi);
-+                            }
-+                            else
-+                                ILFree(target);
-+                        }
-+                    }
-+                    ILFree(lnk_pidl);
-+                }
-+            }
-             if(FAILED(hr))
-             {
-                 events_NavigationFailed(This, absolute_pidl);
-@@ -1432,14 +1747,21 @@
- }
- 
- static HRESULT WINAPI IShellBrowser_fnSendControlMsg(IShellBrowser *iface,
--                                                     UINT id, UINT uMsg,
--                                                     WPARAM wParam, LPARAM lParam,
--                                                     LRESULT *pret)
-+                                                       UINT id, UINT uMsg,
-+                                                       WPARAM wParam, LPARAM lParam,
-+                                                       LRESULT *pret)
- {
-     ExplorerBrowserImpl *This = impl_from_IShellBrowser(iface);
--    FIXME("stub, %p (%d, %d, %Ix, %Ix, %p)\n", This, id, uMsg, wParam, lParam, pret);
-+    TRACE("%p (%d, %d, %Ix, %Ix, %p)\n", This, id, uMsg, wParam, lParam, pret);
- 
--    return E_NOTIMPL;
-+    if (This->psv)
-+    {
-+        IShellView *psv = This->psv;
-+        IShellView_AddRef(psv);
-+        IShellView_Release(psv);
-+    }
-+
-+    return S_OK;
- }
- 
- static HRESULT WINAPI IShellBrowser_fnQueryActiveShellView(IShellBrowser *iface,
-@@ -1458,12 +1780,19 @@
- }
- 
- static HRESULT WINAPI IShellBrowser_fnOnViewWindowActive(IShellBrowser *iface,
--                                                         IShellView *pshv)
-+                                                          IShellView *pshv)
- {
-     ExplorerBrowserImpl *This = impl_from_IShellBrowser(iface);
--    FIXME("stub, %p (%p)\n", This, pshv);
-+    TRACE("%p (%p)\n", This, pshv);
- 
--    return E_NOTIMPL;
-+    if (This->psv)
-+        IShellView_Release(This->psv);
-+
-+    This->psv = pshv;
-+    if (This->psv)
-+        IShellView_AddRef(This->psv);
-+
-+    return S_OK;
- }
- 
- static HRESULT WINAPI IShellBrowser_fnSetToolbarItems(IShellBrowser *iface,
-@@ -1556,6 +1885,7 @@
-         if(SUCCEEDED(hr))
-         {
-             LPIDA pida = GlobalLock(medium.hGlobal);
-+            LPCITEMIDLIST pidl_parent = (LPCITEMIDLIST)((LPBYTE)pida + pida->aoffset[0]);
-             LPCITEMIDLIST pidl_child = (LPCITEMIDLIST) ((LPBYTE)pida+pida->aoffset[1]);
- 
-             /* Handle folders by browsing to them. */
-@@ -1564,6 +1894,55 @@
-                 IExplorerBrowser_BrowseToIDList(&This->IExplorerBrowser_iface, pidl_child, SBSP_RELATIVE);
-                 ret = S_OK;
-             }
-+            else
-+            {
-+                char ext[8];
-+                if (_ILGetExtension(pidl_child, ext, sizeof(ext)) && !lstrcmpiA(ext, "lnk"))
-+                {
-+                    LPITEMIDLIST abs_pidl = ILCombine(pidl_parent, pidl_child);
-+                    if (abs_pidl)
-+                    {
-+IShellLinkW *psl;
-+                        TRACE(".lnk dblclick: resolving via ConstructFromFile\n");
-+                        if (SUCCEEDED(IShellLink_ConstructFromFile(NULL, &IID_IShellLinkW, abs_pidl, (IUnknown**)&psl)))
-+                        {
-+                            WCHAR path[MAX_PATH];
-+                            if (SUCCEEDED(IShellLinkW_GetPath(psl, path, MAX_PATH, NULL, 0)))
-+                            {
-+                                LPITEMIDLIST target_pidl3;
-+                                TRACE(".lnk dblclick: target path=%s\n", debugstr_w(path));
-+                                target_pidl3 = ILCreateFromPathW(path);
-+                                TRACE(".lnk dblclick: ILCreateFromPathW -> %p\n", target_pidl3);
-+                                if (target_pidl3)
-+                                {
-+                                    IExplorerBrowser_BrowseToIDList(&This->IExplorerBrowser_iface,
-+                                        target_pidl3, SBSP_ABSOLUTE);
-+                                    ILFree(target_pidl3);
-+                                    IShellLinkW_Release(psl);
-+                                    ret = S_OK;
-+                                }
-+                            }
-+                            if (ret != S_OK)
-+                            {
-+                                LPITEMIDLIST target_pidl3;
-+                                TRACE(".lnk dblclick: GetPath failed, trying GetIDList\n");
-+                                if (SUCCEEDED(IShellLinkW_GetIDList(psl, &target_pidl3)) && target_pidl3)
-+                                {
-+                                    TRACE(".lnk dblclick: GetIDList pidl=%p\n", target_pidl3);
-+                                    IExplorerBrowser_BrowseToIDList(&This->IExplorerBrowser_iface,
-+                                        target_pidl3, SBSP_ABSOLUTE);
-+                                    ILFree(target_pidl3);
-+                                    IShellLinkW_Release(psl);
-+                                    ret = S_OK;
-+                                }
-+                                else
-+                                    IShellLinkW_Release(psl);
-+                            }
-+                        }
-+                        ILFree(abs_pidl);
-+                    }
-+                }
-+            }
-             GlobalUnlock(medium.hGlobal);
-             GlobalFree(medium.hGlobal);
-         }
-@@ -1845,7 +2224,7 @@
- }
- 
- static HRESULT WINAPI NSTCEvents_fnOnSelectionChanged(INameSpaceTreeControlEvents *iface,
--                                                      IShellItemArray *psiaSelection)
-+                                                       IShellItemArray *psiaSelection)
- {
-     ExplorerBrowserImpl *This = impl_from_INameSpaceTreeControlEvents(iface);
-     IShellItem *psi;
-@@ -1856,7 +2235,7 @@
-     if(SUCCEEDED(hr))
-     {
-         hr = IExplorerBrowser_BrowseToObject(&This->IExplorerBrowser_iface,
--                                             (IUnknown*)psi, SBSP_DEFBROWSER);
-+                                          (IUnknown*)psi, SBSP_DEFBROWSER);
-         IShellItem_Release(psi);
-     }
- 
-@@ -2078,6 +2457,7 @@
- 
-     /* Default settings */
-     eb->navpane.show = TRUE;
-+    eb->eb_options = EBO_SHOWFRAMES;
- 
-     list_init(&eb->event_clients);
-     list_init(&eb->travellog);
---- /tmp/orig/dlls/shell32/iconcache.c	2026-07-10 20:08:12.791157956 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/iconcache.c	2026-04-27 06:45:20.835427000 +0900
-@@ -21,6 +21,7 @@
- #include <stdarg.h>
- #include <string.h>
- #include <sys/types.h>
-+#include <math.h>
- 
- #define COBJMACROS
- 
-@@ -333,17 +334,6 @@
-     return ret;
- }
- 
--static BOOL get_imagelist_icon_size(int list, SIZE *size)
--{
--    int cx, cy;
--    if (list < 0 || list >= ARRAY_SIZE(shell_imagelists)) return FALSE;
--
--    if (!ImageList_GetIconSize( shell_imagelists[list], &cx, &cy )) return FALSE;
--    size->cx = cx;
--    size->cy = cy;
--    return TRUE;
--}
--
- /****************************************************************************
-  * SIC_LoadIcon				[internal]
-  *
-@@ -354,15 +344,70 @@
- {
-     HICON hicons[ARRAY_SIZE(shell_imagelists)] = { 0 };
-     HICON hshortcuts[ARRAY_SIZE(hicons)] = { 0 };
-+    SIZE size[ARRAY_SIZE(shell_imagelists)];
-     unsigned int i;
--    SIZE size;
-     INT ret = -1;
-+    INT x, y;
-+
-+    /* Keep track of the sizes in case any icon fails to get extracted */
-+    for (i = 0; i < ARRAY_SIZE(hicons); i++)
-+    {
-+        ImageList_GetIconSize(shell_imagelists[i], &x, &y);
-+        size[i].cx = x;
-+        size[i].cy = y;
-+        PrivateExtractIconsW(sourcefile, index, size[i].cx, size[i].cy, &hicons[i], 0, 1, 0);
-+    }
- 
-+    /* Fill any icon handles that failed to get extracted, by resizing
-+       another icon handle that succeeded and creating the icon from it.
-+       Use a dumb O(n^2) algorithm since ARRAY_SIZE(hicons) is small */
-     for (i = 0; i < ARRAY_SIZE(hicons); i++)
-     {
--        if (!get_imagelist_icon_size( i, &size ) ||
--            !PrivateExtractIconsW( sourcefile, index, size.cx, size.cy, &hicons[i], 0, 1, 0 ))
--            WARN("Failed to load icon %d from %s.\n", index, debugstr_w(sourcefile));
-+        unsigned int k, ix, iy;
-+        BOOL failed = TRUE;
-+        if (hicons[i]) continue;
-+
-+        for (k = 0; k < ARRAY_SIZE(hicons); k++)
-+        {
-+            if (hicons[k])
-+            {
-+                ix = iy = k;
-+                failed = FALSE;
-+                break;
-+            }
-+        }
-+        if (failed) goto fail;
-+
-+        for (k++; k < ARRAY_SIZE(hicons); k++)
-+        {
-+            if (!hicons[k]) continue;
-+
-+            /* Find closest-sized icon, but favor larger icons to resize from */
-+            if (size[k].cx >= size[i].cx)
-+                ix = (size[ix].cx < size[i].cx || size[ix].cx > size[k].cx) ? k : ix;
-+            else
-+                ix = (size[ix].cx < size[i].cx && size[ix].cx < size[k].cx) ? k : ix;
-+
-+            if (size[k].cy >= size[i].cy)
-+                iy = (size[iy].cy < size[i].cy || size[iy].cy > size[k].cy) ? k : iy;
-+            else
-+                iy = (size[iy].cy < size[i].cy && size[iy].cy < size[k].cy) ? k : iy;
-+        }
-+
-+        /* Use the closest icon in aspect ratio if ix and iy differ */
-+        if (ix != iy)
-+        {
-+            float i_ratio, ix_ratio, iy_ratio;
-+            i_ratio  = (float)size[i].cx  / (float)size[i].cy;
-+            ix_ratio = (float)size[ix].cx / (float)size[ix].cy;
-+            iy_ratio = (float)size[iy].cx / (float)size[iy].cy;
-+            if (fabsf(ix_ratio - i_ratio) > fabsf(iy_ratio - i_ratio))
-+                ix = iy;
-+        }
-+
-+        /* If this fails, we have to abort to prevent the image lists from
-+           becoming out of sync and completely screwing the icons up */
-+        hicons[i] = CopyImage(hicons[ix], IMAGE_ICON, size[i].cx, size[i].cy, 0);
-         if (!hicons[i]) goto fail;
-     }
- 
---- /tmp/orig/dlls/shell32/pidl.c	2026-07-10 20:08:12.826157564 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/pidl.c	2026-05-24 10:53:12.361507802 +0900
-@@ -1900,7 +1900,7 @@
- 
-     TRACE("(%p)\n",pidl);
- 
--    return (pidl && lpPData && (PT_FOLDER == lpPData->type || PT_FOLDER1 == lpPData->type));
-+    return (pidl && lpPData && (PT_FOLDER == lpPData->type || PT_FOLDER1 == lpPData->type || PT_UNIXMOUNT == lpPData->type));
- }
- 
- BOOL _ILIsValue(LPCITEMIDLIST pidl)
-@@ -2157,6 +2157,9 @@
- 
-     case PT_VALUEW:
-         return (LPWSTR)pdata->u.file.szNames;
-+
-+    case PT_UNIXMOUNT:
-+        return (LPWSTR)((BYTE*)pdata + 1);
-     }
-     return NULL;
- }
---- /tmp/orig/dlls/shell32/shell32_main.c	2026-07-10 20:08:12.759158314 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/shell32_main.c	2026-06-03 12:20:20.408916800 +0900
-@@ -1215,6 +1215,23 @@
- HRESULT WINAPI SHCreateDataObject(PCIDLIST_ABSOLUTE pidl_folder, UINT count, PCUITEMID_CHILD_ARRAY pidl_array,
-                                   IDataObject *object, REFIID riid, void **ppv)
- {
--    FIXME("%p %d %p %p %s %p: stub\n", pidl_folder, count, pidl_array, object, debugstr_guid(riid), ppv);
--    return E_NOTIMPL;
-+    IDataObject *pDataObj;
-+    HRESULT hr;
-+
-+    TRACE("(%p, %u, %p, %p, %s, %p)\n", pidl_folder, count, pidl_array, object, debugstr_guid(riid), ppv);
-+
-+    if (!ppv) return E_INVALIDARG;
-+    *ppv = NULL;
-+
-+    if (object)
-+        FIXME("delegate object not supported\n");
-+
-+    pDataObj = IDataObject_Constructor(NULL, pidl_folder, (const ITEMIDLIST **)pidl_array, count);
-+    if (!pDataObj) return E_OUTOFMEMORY;
-+
-+    hr = IDataObject_QueryInterface(pDataObj, riid, ppv);
-+    IDataObject_Release(pDataObj);
-+
-+    TRACE("returning %08lx, ppv=%p\n", hr, *ppv);
-+    return hr;
- }
---- /tmp/orig/dlls/shell32/shfldr_desktop.c	2026-07-10 20:08:12.804157811 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/shfldr_desktop.c	2026-06-03 08:36:37.954174357 +0900
-@@ -218,15 +218,17 @@
-         {
-             if (*lpszDisplayName == '/')
-             {
--                /* UNIX paths should be parsed by unixfs */
--                IShellFolder *unixFS;
--                hr = UnixFolder_Constructor(NULL, &IID_IShellFolder, (LPVOID*)&unixFS);
--                if (SUCCEEDED(hr))
-+                /* Convert /unix/path to \\?\unix\unix\path and route through existing
-+                 * UnixDosFolder parsing, which correctly handles hierarchical PIDL creation. */
-+                lstrcpynW(szElement, L"\\\\?\\unix", ARRAY_SIZE(szElement));
-+                lstrcpynW(szElement + 8, lpszDisplayName, ARRAY_SIZE(szElement) - 8);
-                 {
--                    hr = IShellFolder_ParseDisplayName(unixFS, NULL, NULL,
--                            lpszDisplayName, NULL, &pidlTemp, NULL);
--                    IShellFolder_Release(unixFS);
-+                    LPWSTR p;
-+                    for (p = szElement; *p; p++) if (*p == '/') *p = '\\';
-                 }
-+                pidlTemp = _ILCreateGuid(PT_GUID, &CLSID_UnixDosFolder);
-+                hr = S_OK;
-+                szNext = szElement;
-             }
-             else
-             {
-@@ -246,20 +248,24 @@
-                     /* should never reach here, but for completeness */
-                     hr = E_NOT_SUFFICIENT_BUFFER;
-                 }
-+                szNext = NULL;
-             }
-         }
-         else
-+        {
-             pidlTemp = _ILCreateMyComputer();
--
--        szNext = NULL;
-+            szNext = NULL;
-+        }
-     }
- 
-     if (SUCCEEDED(hr) && pidlTemp)
-     {
-         if (szNext && *szNext)
-         {
-+            WARN("[v12.7-STAGING] desktop ParseDisplayName: calling SHELL32_ParseNextElement szNext=%s pidlTemp=%p\n", debugstr_w(szNext), pidlTemp);
-             hr = SHELL32_ParseNextElement(iface, hwndOwner, pbc,
-                     &pidlTemp, (LPOLESTR) szNext, pchEaten, pdwAttributes);
-+            WARN("[v12.7-STAGING] desktop ParseDisplayName: after SHELL32_ParseNextElement hr=0x%08lx pidlTemp=%p\n", hr, pidlTemp);
-         }
-         else
-         {
---- /tmp/orig/dlls/shell32/shfldr_fs.c	2026-07-10 20:08:12.734808490 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/shfldr_fs.c	2026-06-03 08:19:57.226648887 +0900
-@@ -328,6 +328,9 @@
-         len = lstrlenW(szPath);
-         /* get the next element */
-         szNext = GetNextElementW( lpszDisplayName, szPath + len, MAX_PATH - len );
-+        WARN("[v12.7-STAGING] fs ParseDisplayName: sPathTarget=%s lpszDisplayName=%s szPath=%s len=%lu szNext=%s\n",
-+             debugstr_w(This->sPathTarget), debugstr_w(lpszDisplayName),
-+             debugstr_w(szPath), len, debugstr_w(szNext));
- 
-         if (IsEqualCLSID( This->pclsid, &CLSID_UnixFolder ) && lpszDisplayName[0] == '/')
-         {
-@@ -340,6 +343,8 @@
-             if ((p = wcschr( szPath + len, '\\' )))
-                 while (*p == '\\') *p++ = 0;
-             szNext = p;
-+            WARN("[v12.7-STAGING] fs ParseDisplayName: unix path szPath=%s szNext=%s\n",
-+                 debugstr_w(szPath), debugstr_w(szNext));
-         }
- 
-         /* Special case for the root folder. */
-@@ -355,7 +360,9 @@
- 
-         if (szNext && *szNext)
-         {
-+            WARN("[v12.7-STAGING] fs ParseDisplayName: calling _ILCreateFromPathW szPath=%s\n", debugstr_w(szPath));
-             hr = _ILCreateFromPathW( szPath, &pidlTemp );
-+            WARN("[v12.7-STAGING] fs ParseDisplayName: _ILCreateFromPathW hr=0x%08lx pidlTemp=%p\n", hr, pidlTemp);
-             if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) && fsbd)
-             {
-                 find_data.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-@@ -363,8 +370,12 @@
-                 pidlTemp = _ILCreateFromFindDataW( &find_data );
-             }
-             if (pidlTemp) /* try to analyse the next element */
-+            {
-+                WARN("[v12.7-STAGING] fs ParseDisplayName: calling SHELL32_ParseNextElement pidlTemp=%p szNext=%s\n", pidlTemp, debugstr_w(szNext));
-                 hr = SHELL32_ParseNextElement( iface, hwndOwner, pbc, &pidlTemp,
-                                                (WCHAR *)szNext, pchEaten, pdwAttributes );
-+                WARN("[v12.7-STAGING] fs ParseDisplayName: after SHELL32_ParseNextElement hr=0x%08lx pidlTemp=%p\n", hr, pidlTemp);
-+            }
-         }
-         else  /* it's the last element */
-         {
-@@ -387,6 +398,15 @@
-     else
-         *ppidl = NULL;
- 
-+    /* Fallback: route bare Unix paths through SHParseDisplayName (desktop → MyComputer → Z:) */
-+    if (FAILED(hr) && !*ppidl && lpszDisplayName && lpszDisplayName[0] == '/'
-+            && !IsEqualCLSID(This->pclsid, &CLSID_UnixFolder))
-+    {
-+        WARN("[v12.7-STAGING] fs ParseDisplayName: fallback SHParseDisplayName for %s\n", debugstr_w(lpszDisplayName));
-+        hr = SHParseDisplayName(lpszDisplayName, pbc, ppidl, 0, NULL);
-+        WARN("[v12.7-STAGING] fs ParseDisplayName: fallback hr=0x%08lx ppidl=%p\n", hr, *ppidl);
-+    }
-+
-     TRACE ("(%p)->(-- pidl=%p ret=0x%08lx)\n", This, *ppidl, hr);
- 
-     if (fsbd) IFileSystemBindData_Release( fsbd );
-@@ -1850,7 +1870,7 @@
- 
- HRESULT WINAPI UnixDosFolder_Constructor(IUnknown *outer_unk, REFIID riid, void **ppv)
- {
--    return create_fs( outer_unk, riid, ppv, &CLSID_UnixDosFolder, NULL );
-+    return create_fs( outer_unk, riid, ppv, &CLSID_UnixDosFolder, L"\\\\?\\unix\\" );
- }
- 
- HRESULT WINAPI FolderShortcut_Constructor(IUnknown *outer_unk, REFIID riid, void **ppv)
---- /tmp/orig/dlls/shell32/shfldr_mycomp.c	2026-07-10 20:08:12.708158885 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/shfldr_mycomp.c	2026-05-31 18:19:53.077777046 +0900
-@@ -39,6 +39,10 @@
- #include "wine/debug.h"
- #include "debughlp.h"
- #include "shfldr.h"
-+#include <stdio.h>
-+#include <string.h>
-+#include <stdlib.h>
-+#include <io.h>
- 
- WINE_DEFAULT_DEBUG_CHANNEL (shell);
- 
-@@ -273,6 +277,116 @@
- }
- 
- /**************************************************************************
-+ * Unix mount points
-+ */
-+static LPITEMIDLIST create_unix_mount_pidl(const char *mount_point)
-+{
-+    WCHAR mountW[MAX_PATH], *name_start;
-+    int name_len_bytes, path_len_bytes;
-+    int mount_len;
-+    LPITEMIDLIST pidl;
-+
-+    mount_len = MultiByteToWideChar(CP_UTF8, 0, mount_point, -1, mountW, MAX_PATH);
-+    if (mount_len <= 0) return NULL;
-+
-+    name_start = wcsrchr(mountW, L'/');
-+    if (!name_start) name_start = mountW;
-+    else name_start++;
-+
-+    name_len_bytes = (lstrlenW(name_start) + 1) * sizeof(WCHAR);
-+    path_len_bytes = mount_len * sizeof(WCHAR);
-+
-+    pidl = SHAlloc(offsetof(SHITEMID, abID) + 1 + name_len_bytes + path_len_bytes + sizeof(WORD));
-+    if (!pidl) return NULL;
-+
-+    pidl->mkid.cb = sizeof(pidl->mkid.cb) + 1 + name_len_bytes + path_len_bytes;
-+    pidl->mkid.abID[0] = PT_UNIXMOUNT;
-+    memcpy(pidl->mkid.abID + 1, name_start, name_len_bytes);
-+    memcpy(pidl->mkid.abID + 1 + name_len_bytes, mountW, path_len_bytes);
-+
-+    return pidl;
-+}
-+
-+static BOOL add_unix_mount_point(IEnumIDListImpl *list, const char *mount_point)
-+{
-+    LPITEMIDLIST pidl = create_unix_mount_pidl(mount_point);
-+
-+    if (!pidl) return TRUE;
-+    return AddToEnumList(list, pidl);
-+}
-+
-+static int is_pseudo_fs(const char *fstype)
-+{
-+    static const char *pseudo_fses[] = {
-+        "proc", "sysfs", "tmpfs", "devtmpfs", "devpts", "cgroup", "cgroup2",
-+        "pstore", "securityfs", "hugetlbfs", "configfs", "efivarfs", "bpf",
-+        "debugfs", "tracefs", "selinuxfs", "autofs", "overlay", "fuse.gvfsd-fuse",
-+        "fuse.portal", "fuse.gvfsd-metadata", "rpc_pipefs", "sunrpc",
-+        "mqueue", "cpuset", "nsfs", "squashfs", "iso9660", "udf",
-+        "ramfs", "fusectl", "efivarfs", NULL
-+    };
-+    int i;
-+    for (i = 0; pseudo_fses[i]; i++)
-+        if (strcmp(fstype, pseudo_fses[i]) == 0) return 1;
-+    return 0;
-+}
-+
-+static int is_system_mount(const char *mount_point)
-+{
-+    if (strcmp(mount_point, "/") == 0) return 1;
-+    if (strcmp(mount_point, "/boot") == 0) return 1;
-+    if (strcmp(mount_point, "/boot/efi") == 0) return 1;
-+    if (strncmp(mount_point, "/snap/", 6) == 0) return 1;
-+    if (strncmp(mount_point, "/var/lib/snapd/", 15) == 0) return 1;
-+    if (strncmp(mount_point, "/run/", 5) == 0) return 1;
-+    if (strncmp(mount_point, "/sys/", 5) == 0) return 1;
-+    if (strncmp(mount_point, "/proc/", 6) == 0) return 1;
-+    if (strncmp(mount_point, "/dev/", 5) == 0) return 1;
-+    return 0;
-+}
-+
-+static int is_network_fs(const char *fstype)
-+{
-+    static const char *network[] = {
-+        "cifs", "smbfs", "nfs", "nfs3", "nfs4", NULL
-+    };
-+    int i;
-+    for (i = 0; network[i]; i++)
-+        if (!strcmp(fstype, network[i])) return 1;
-+    return 0;
-+}
-+
-+static void enumerate_unix_mounts(IEnumIDListImpl *list)
-+{
-+    FILE *f = fopen("/proc/mounts", "r");
-+    char line[4096];
-+    int count = 0;
-+
-+    if (!f) return;
-+
-+    while (fgets(line, sizeof(line), f))
-+    {
-+char device[256], mount_point[4096], fstype[64], options[256];
-+
-+            if (sscanf(line, "%255s %4095s %63s %255s %*d %*d",
-+                       device, mount_point, fstype, options) < 3)
-+                continue;
-+
-+            if (is_pseudo_fs(fstype)) continue;
-+            if (is_system_mount(mount_point)) continue;
-+
-+            if (!is_network_fs(fstype) && _access(mount_point, 0) != 0)
-+                continue;
-+
-+        if (!add_unix_mount_point(list, mount_point))
-+            break;
-+        count++;
-+    }
-+    fclose(f);
-+    TRACE("Added %d Linux mount points.\n", count);
-+}
-+
-+/**************************************************************************
-  *  CreateMyCompEnumList()
-  */
- static BOOL CreateMyCompEnumList(IEnumIDListImpl *list, DWORD dwFlags)
-@@ -297,6 +411,9 @@
-             dwDrivemap = dwDrivemap >> 1;
-         }
- 
-+        /* Add Linux mount points */
-+        enumerate_unix_mounts(list);
-+
-         TRACE("-- (%p)-> enumerate (mycomputer shell extensions)\n",list);
-         for (i=0; i<2; i++) {
-             if (ret && !RegOpenKeyExW(i == 0 ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER,
-@@ -361,10 +478,82 @@
-                LPCITEMIDLIST pidl, LPBC pbcReserved, REFIID riid, LPVOID *ppvOut)
- {
-     IMyComputerFolderImpl *This = impl_from_IShellFolder2(iface);
-+    LPPIDLDATA pdata;
- 
-     TRACE("(%p)->(pidl=%p,%p,%s,%p)\n", This,
-           pidl, pbcReserved, shdebugstr_guid (riid), ppvOut);
- 
-+    pdata = _ILGetDataPointer(pidl);
-+    if (pdata && pdata->type == PT_UNIXMOUNT)
-+    {
-+        LPCWSTR basename = (LPCWSTR)((BYTE*)pdata + 1);
-+        size_t name_bytes = (lstrlenW(basename) + 1) * sizeof(WCHAR);
-+        LPWSTR mount_path = (LPWSTR)((BYTE*)pdata + 1 + name_bytes);
-+        WCHAR win_path[MAX_PATH], *p;
-+        HRESULT hr;
-+
-+        /* Convert /mount/point to Z:\mount\point */
-+        swprintf(win_path, ARRAY_SIZE(win_path), L"Z:%s", mount_path);
-+        for (p = win_path; *p; p++) if (*p == L'/') *p = L'\\';
-+
-+        {
-+            /* Pre-check: verify mount still exists in /proc/mounts to avoid hanging */
-+            char mount_utf8[MAX_PATH];
-+            WideCharToMultiByte(CP_UTF8, 0, mount_path, -1, mount_utf8, MAX_PATH, NULL, NULL);
-+            {
-+                FILE *mf = fopen("/proc/mounts", "r");
-+                int found = 0;
-+                if (mf)
-+                {
-+                    char mline[4096];
-+                    while (fgets(mline, sizeof(mline), mf))
-+                    {
-+                        char mp[4096];
-+                        if (sscanf(mline, "%*s %4095s", mp) >= 1 &&
-+                            !strcmp(mp, mount_utf8))
-+                        {
-+                            found = 1;
-+                            break;
-+                        }
-+                    }
-+                    fclose(mf);
-+                }
-+                if (!found)
-+                {
-+                    WARN("Unix mount %s no longer in /proc/mounts\n", mount_utf8);
-+                    return HRESULT_FROM_WIN32(ERROR_NOT_READY);
-+                }
-+            }
-+        }
-+
-+        {
-+            LPITEMIDLIST abs_pidl = ILCreateFromPathW(win_path);
-+            if (abs_pidl)
-+            {
-+                IShellFolder *psfParent, *psfMount;
-+                LPCITEMIDLIST pidlChild;
-+                hr = SHBindToParent(abs_pidl, &IID_IShellFolder, (void**)&psfParent, &pidlChild);
-+                if (SUCCEEDED(hr))
-+                {
-+                    hr = IShellFolder_BindToObject(psfParent, pidlChild, NULL, &IID_IShellFolder, (void**)&psfMount);
-+                    IShellFolder_Release(psfParent);
-+                    if (SUCCEEDED(hr))
-+                    {
-+                        LPCITEMIDLIST remaining = ILGetNext(pidl);
-+                        if (!_ILIsEmpty(remaining))
-+                            hr = IShellFolder_BindToObject(psfMount, remaining, NULL, riid, ppvOut);
-+                        else
-+                            hr = IShellFolder_QueryInterface(psfMount, riid, ppvOut);
-+                        IShellFolder_Release(psfMount);
-+                    }
-+                }
-+                ILFree(abs_pidl);
-+                return hr;
-+            }
-+        }
-+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-+    }
-+
-     return SHELL32_BindToChild (This->pidlRoot, &CLSID_ShellFSFolder, NULL, pidl, riid, ppvOut);
- }
- 
-@@ -470,8 +659,11 @@
-         }
-     } else {
-         while (cidl > 0 && *apidl) {
-+            LPPIDLDATA pdata = _ILGetDataPointer(*apidl);
-             pdump (*apidl);
-             SHELL32_GetItemAttributes(&This->IShellFolder2_iface, *apidl, rgfInOut);
-+            if (pdata && pdata->type == PT_UNIXMOUNT)
-+                *rgfInOut |= SFGAO_FOLDER | SFGAO_FILESYSTEM | SFGAO_CANLINK | SFGAO_HASSUBFOLDER | SFGAO_BROWSABLE;
-             apidl++;
-             cidl--;
-         }
-@@ -681,12 +873,20 @@
-                 lstrcpyW (pszPath, wszDrive);
-             }
-         }
--        else 
-+        else
-         {
--            /* Neither a shell namespace extension nor a drive letter. */
--            ERR("Wrong pidl type\n");
--            CoTaskMemFree(pszPath);
--            return E_INVALIDARG;
-+            LPPIDLDATA pdata = _ILGetDataPointer(pidl);
-+            if (pdata && pdata->type == PT_UNIXMOUNT)
-+            {
-+                _ILSimpleGetTextW(pidl, pszPath, MAX_PATH);
-+            }
-+            else
-+            {
-+                /* Neither a shell namespace extension nor a drive letter. */
-+                ERR("Wrong pidl type\n");
-+                CoTaskMemFree(pszPath);
-+                return E_INVALIDARG;
-+            }
-         }
-     }
-     else
---- /tmp/orig/dlls/shell32/shlexec.c	2026-07-10 20:08:12.850157296 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/shlexec.c	2026-05-20 23:11:38.988699563 +0900
-@@ -1890,6 +1890,71 @@
-     retval = SHELL_FindExecutable(sei_tmp.lpDirectory, lpFile, sei_tmp.lpVerb, wcmd, wcmdLen, wszKeyname, &env, sei_tmp.lpIDList, sei_tmp.lpParameters);
-     if (retval > 32)  /* Found */
-     {
-+        /* Native file manager: intercept explorer.exe /select */
-+        {
-+            static BOOL checked = FALSE;
-+            static BOOL use_native = TRUE;
-+            UINT j;
-+            if (!checked)
-+            {
-+                const char *env2 = getenv("WINE_NATIVE_FILE_MANAGER");
-+                if (env2 && (!strcmp(env2, "0") || !strcmp(env2, "false")))
-+                    use_native = FALSE;
-+                checked = TRUE;
-+            }
-+            if (use_native && wcsstr(wszParameters, L"/select")
-+                && (wcsstr(lpFile, L"explorer") || wcsstr(wszKeyname, L"explorer")))
-+            {
-+                WCHAR *sel = wcsstr(wszParameters, L"/select,");
-+                if (!sel) sel = wcsstr(wszParameters, L"/SELECT,");
-+                if (sel)
-+                {
-+                    WCHAR path[MAX_PATH], *start = sel + 8;
-+                    while (*start == L' ' || *start == L'\t') start++;
-+                    if (*start == L'"')
-+                    {
-+                        for (j = 0; j < MAX_PATH - 1 && start[j + 1] && start[j + 1] != L'"'; j++)
-+                            path[j] = start[j + 1];
-+                        path[j] = L'\0';
-+                    }
-+                    else
-+                    {
-+                        for (j = 0; j < MAX_PATH - 1 && start[j] && start[j] != L' '; j++)
-+                            path[j] = start[j];
-+                        path[j] = L'\0';
-+                    }
-+                    if (path[0])
-+                    {
-+                        WCHAR exe[MAX_PATH], cl[4096];
-+                        WCHAR parent[MAX_PATH];
-+                        lstrcpyW(parent, path);
-+                        WCHAR *bs = wcsrchr(parent, L'\\');
-+                        if (bs) *bs = L'\0';
-+                        GetSystemDirectoryW(exe, MAX_PATH);
-+                        lstrcatW(exe, L"\\wineopenfolder.exe");
-+                        lstrcpyW(cl, L"\"");
-+                        lstrcatW(cl, exe);
-+                        lstrcatW(cl, L"\" \"");
-+                        lstrcatW(cl, parent);
-+                        lstrcatW(cl, L"\" --select \"");
-+                        lstrcatW(cl, path);
-+                        lstrcatW(cl, L"\"");
-+                        STARTUPINFOW si;
-+                        PROCESS_INFORMATION pi;
-+                        memset(&si, 0, sizeof(si));
-+                        si.cb = sizeof(si);
-+                        if (CreateProcessW(exe, cl, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
-+                        {
-+                            CloseHandle(pi.hThread);
-+                            CloseHandle(pi.hProcess);
-+                            free(env);
-+                            retval = 33;
-+                            goto end;
-+                        }
-+                    }
-+                }
-+            }
-+        }
-         retval = SHELL_quote_and_execute( wcmd, wszParameters, wszKeyname,
-                                           wszApplicationName, env, &sei_tmp,
-                                           sei, execfunc );
---- /tmp/orig/dlls/shell32/shlfolder.c	2026-07-10 20:08:12.779158091 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/shlfolder.c	2026-05-20 20:44:23.545801350 +0900
-@@ -659,6 +659,105 @@
-     if (flags & OFASI_EDIT && cidl > 1)
-         flags &= ~OFASI_EDIT;
- 
-+    /* Native file manager support (xdg-open / nautilus)
-+     * Controlled by WINE_NATIVE_FILE_MANAGER env var (default enabled, set to "0" to disable) */
-+    {
-+        static BOOL checked = FALSE;
-+        static BOOL use_native = TRUE;
-+        WCHAR folder_path[MAX_PATH];
-+        WCHAR exe_path[MAX_PATH], cmdline[4096];
-+        STARTUPINFOW si;
-+        PROCESS_INFORMATION pi;
-+
-+        if (!checked)
-+        {
-+            const char *env = getenv("WINE_NATIVE_FILE_MANAGER");
-+            if (env && (!strcmp(env, "0") || !strcmp(env, "false")))
-+                use_native = FALSE;
-+            checked = TRUE;
-+        }
-+
-+        if (use_native)
-+        {
-+            BOOL got_path = FALSE;
-+
-+            if (cidl > 0)
-+            {
-+                got_path = SHGetPathFromIDListW(pidlFolder, folder_path);
-+            }
-+            else
-+            {
-+                LPITEMIDLIST parent = ILClone(pidlFolder);
-+                if (parent)
-+                {
-+                    ILRemoveLastID(parent);
-+                    got_path = SHGetPathFromIDListW(parent, folder_path);
-+                    ILFree(parent);
-+                }
-+            }
-+
-+            if (got_path)
-+            {
-+                GetSystemDirectoryW(exe_path, MAX_PATH);
-+                lstrcatW(exe_path, L"\\wineopenfolder.exe");
-+
-+                lstrcpyW(cmdline, L"\"");
-+                lstrcatW(cmdline, exe_path);
-+                lstrcatW(cmdline, L"\" \"");
-+                lstrcatW(cmdline, folder_path);
-+                lstrcatW(cmdline, L"\"");
-+
-+                if (cidl > 0)
-+                {
-+                    unsigned int j;
-+                    for (j = 0; j < cidl; j++)
-+                    {
-+                        LPITEMIDLIST full_child = ILCombine(pidlFolder, apidl[j]);
-+                        if (full_child)
-+                        {
-+                            WCHAR child_path[MAX_PATH];
-+                            if (SHGetPathFromIDListW(full_child, child_path))
-+                            {
-+                                lstrcatW(cmdline, L" --select \"");
-+                                lstrcatW(cmdline, child_path);
-+                                lstrcatW(cmdline, L"\"");
-+                            }
-+                            ILFree(full_child);
-+                        }
-+                    }
-+                }
-+                else
-+                {
-+                    LPITEMIDLIST child = ILClone(pidlFolder);
-+                    if (child)
-+                    {
-+                        WCHAR child_path[MAX_PATH];
-+                        if (SHGetPathFromIDListW(child, child_path))
-+                        {
-+                            lstrcatW(cmdline, L" --select \"");
-+                            lstrcatW(cmdline, child_path);
-+                            lstrcatW(cmdline, L"\"");
-+                        }
-+                        ILFree(child);
-+                    }
-+                }
-+
-+                TRACE("Launching native file manager: %s\n", wine_dbgstr_w(cmdline));
-+
-+                memset(&si, 0, sizeof(si));
-+                si.cb = sizeof(si);
-+                if (CreateProcessW(exe_path, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
-+                {
-+                    CloseHandle(pi.hThread);
-+                    CloseHandle(pi.hProcess);
-+                    return S_OK;
-+                }
-+                WARN("Failed to launch wineopenfolder.exe (error %lu), falling back to built-in\n",
-+                     GetLastError());
-+            }
-+        }
-+    }
-+
-     hr = CoCreateInstance(&CLSID_ShellWindows, NULL, CLSCTX_LOCAL_SERVER, &IID_IShellWindows,
-                           (void **)&sw);
-     if (FAILED(hr))
---- /tmp/orig/dlls/shell32/shlview.c	2026-07-10 20:08:12.891156837 +0900
-+++ /home/p-yoko/Wine_Aviutl2_Adapter/wine/dlls/shell32/shlview.c	2026-05-18 22:08:05.846845004 +0900
-@@ -335,6 +335,7 @@
- 	  case FVM_DETAILS:	dwStyle = LVS_REPORT;		break;
- 	  case FVM_SMALLICON:	dwStyle = LVS_SMALLICON;	break;
- 	  case FVM_LIST:	dwStyle = LVS_LIST;		break;
-+	  case FVM_AUTO:	dwStyle = LVS_LIST;		break;
- 	  default:
- 	  {
- 		FIXME("ViewMode %d not implemented\n", ViewMode);
+\ No newline at end of file
