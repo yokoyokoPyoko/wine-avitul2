@@ -19,9 +19,14 @@ autom4te.cache/
 
 # Project specific
 /wine/
+/wine-11.16/
+/logs/
 !/wine/dlls/wined3d/
 !/wine/dlls/d3d11/
 !/wine/dlls/dxgi/
 !/wine/dlls/user32/
+# Note: wine-11.16/ is a git worktree (branch aviutl2-wine-11.16 in wine/.git).
+# Moved here from /tmp/opencode (volatile) on 2026-09-15 after /tmp cleanup
+# deleted the build tree (commits were safe in wine/.git). Never track it.
 # Note: If the entire wine source is meant to be tracked, we can adjust this.
 # For now, tracking only the modified DLL directories.

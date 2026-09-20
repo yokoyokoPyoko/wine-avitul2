@@ -17,7 +17,7 @@
 # Prefix update rewrites system32, so deploying BEFORE it would be lost.
 set -euo pipefail
 
-WINE_SOURCE="${WINE_SOURCE:-/home/p-yoko/Program/Cpp/Wine_Aviutl2_Adapter/wine}"
+WINE_SOURCE="${WINE_SOURCE:-/home/p-yoko/Program/Cpp/Wine_Aviutl2_Adapter/wine-11.16}"
 WINE_BIN="/opt/wine-staging/bin/wine"
 OPT_DIR="/opt/wine-staging/lib/wine/x86_64-windows"
 PREFIX_DIR="$HOME/.wine/drive_c/windows/system32"
@@ -65,9 +65,19 @@ install_dll() {
     echo "deployed $name.dll"
 }
 
-for pair in "wined3d:wined3d" "d3d11:d3d11" "comdlg32:comdlg32" "shell32:shell32" "dwrite:dwrite" "user32:user32" "win32u:win32u"; do
+for pair in "wined3d:wined3d" "d3d11:d3d11" "comdlg32:comdlg32" "shell32:shell32" "dwrite:dwrite" "user32:user32"; do
     install_dll "${pair%%:*}" "${pair##*:}"
 done
+
+# win32u.so (unixlib, /opt only - no system32 counterpart)
+WIN32U_SRC="$WINE_SOURCE/dlls/win32u/win32u.so"
+if [ -f "$WIN32U_SRC" ]; then
+    opt_backup_once "$OPT_DIR/win32u.so"
+    opt_cp "$WIN32U_SRC" "$OPT_DIR/"
+    echo "deployed win32u.so"
+else
+    echo "WARNING: $WIN32U_SRC not found, skipping win32u.so" >&2
+fi
 
 # explorer.exe (patched: /select -> native file manager)
 EXPLORER_SRC="$WINE_SOURCE/programs/explorer/x86_64-windows/explorer.exe"
