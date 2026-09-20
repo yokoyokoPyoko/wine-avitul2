@@ -268,7 +268,7 @@ index 42f8307432f..ad07ffa180e 100644
  
      shader_spirv_invalidate_contexts_compute_program(&device_vk->d, program);
 diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
-index f8f0076bbd6..13f2febe733 100644
+index f8f0076bbd6..b45248fe45f 100644
 --- a/dlls/wined3d/swapchain.c
 +++ b/dlls/wined3d/swapchain.c
 @@ -227,12 +227,19 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
@@ -292,36 +292,22 @@ index f8f0076bbd6..13f2febe733 100644
      }
  
      wined3d_mutex_lock();
-@@ -264,6 +271,28 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+@@ -264,6 +271,14 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
  
      wined3d_mutex_unlock();
  
-+    {
-+        static BOOL in_pump = FALSE;
-+        if (!in_pump)
-+        {
-+            MSG pump_msg;
-+            in_pump = TRUE;
-+            /* [AviUtl2] Relay only WM_MOUSEMOVE. Dispatching action messages
-+             * (key/button) from inside Present deadlocks: the app's handler
-+             * waits (WaitForSingleObject) for the presenting loop to progress,
-+             * which is blocked in this nested Dispatch (proven by winedbg
-+             * stack trace, 2026-09-14). Action messages stay queued and run
-+             * after playback, as before this pump existed. */
-+            if (PeekMessageW(&pump_msg, NULL, WM_MOUSEMOVE, WM_MOUSEMOVE,
-+                    PM_REMOVE | PM_QS_INPUT))
-+            {
-+                TranslateMessage(&pump_msg);
-+                DispatchMessageW(&pump_msg);
-+            }
-+            in_pump = FALSE;
-+        }
-+    }
++    /* [AviUtl2] NOTE (2026-09-20): a message pump lived here (first all input,
++     * then mousemove-only). Removed entirely: any nested DispatchMessageW from
++     * inside Present is unsafe. Key/button dispatch self-deadlocks (app waits
++     * for the presenting loop, proven 2026-09-14), and mousemove dispatch is
++     * suspected in a re-play use-after-free crash (mouse-tracking teardown
++     * racing nested dispatch, 2026-09-20). Queued input runs when the app
++     * returns to its own loop, as upstream. */
 +
      return WINED3D_OK;
  }
  
-@@ -554,9 +583,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
+@@ -554,9 +569,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
      unsigned int i;
      static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
  
@@ -333,7 +319,7 @@ index f8f0076bbd6..13f2febe733 100644
  
      texture_prev = wined3d_texture_gl(swapchain->back_buffers[0]);
  
-@@ -927,20 +955,32 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -927,20 +941,32 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      RECT client_rect;
      VkResult vr;
  
@@ -375,7 +361,7 @@ index f8f0076bbd6..13f2febe733 100644
  
      if ((vr = VK_CALL(vkGetPhysicalDeviceSurfaceSupportKHR(adapter_vk->physical_device,
              device_vk->graphics_queue.vk_queue_family_index, vk_surface, &supported))) < 0 || !supported)
-@@ -1007,7 +1047,9 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1007,7 +1033,9 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      vk_present_mode = VK_PRESENT_MODE_FIFO_KHR;
      if (!swapchain_vk->s.swap_interval)
      {
@@ -386,7 +372,7 @@ index f8f0076bbd6..13f2febe733 100644
              vk_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
          else
              FIXME("Unsupported swap interval %u.\n", swapchain_vk->s.swap_interval);
-@@ -1031,7 +1073,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1031,7 +1059,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      vk_swapchain_desc.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
      vk_swapchain_desc.presentMode = vk_present_mode;
      vk_swapchain_desc.clipped = VK_TRUE;
@@ -395,7 +381,7 @@ index f8f0076bbd6..13f2febe733 100644
      if ((vr = VK_CALL(vkCreateSwapchainKHR(device_vk->vk_device, &vk_swapchain_desc, NULL, &vk_swapchain))) < 0)
      {
          ERR("Failed to create Vulkan swapchain, vr %s.\n", wined3d_debug_vkresult(vr));
-@@ -1042,17 +1084,42 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1042,17 +1070,42 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      if (!wined3d_swapchain_vk_create_vulkan_swapchain_images(swapchain_vk, vk_swapchain))
      {
          VK_CALL(vkDestroySwapchainKHR(device_vk->vk_device, vk_swapchain, NULL));
@@ -440,7 +426,7 @@ index f8f0076bbd6..13f2febe733 100644
      return E_FAIL;
  }
  
-@@ -1060,8 +1127,6 @@ static HRESULT wined3d_swapchain_vk_recreate(struct wined3d_swapchain_vk *swapch
+@@ -1060,8 +1113,6 @@ static HRESULT wined3d_swapchain_vk_recreate(struct wined3d_swapchain_vk *swapch
  {
      TRACE("swapchain_vk %p.\n", swapchain_vk);
  
@@ -449,7 +435,7 @@ index f8f0076bbd6..13f2febe733 100644
      return wined3d_swapchain_vk_create_vulkan_swapchain(swapchain_vk);
  }
  
-@@ -1109,12 +1174,22 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1109,12 +1160,22 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
  
      present_idx = swapchain_vk->current++ % swapchain_vk->image_count;
      wined3d_context_vk_wait_command_buffer(context_vk, swapchain_vk->vk_semaphores[present_idx].command_buffer_id);
@@ -474,7 +460,7 @@ index f8f0076bbd6..13f2febe733 100644
  
      if (dst_rect->right > swapchain_vk->width || dst_rect->bottom > swapchain_vk->height)
      {
-@@ -1140,7 +1215,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1140,7 +1201,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
  
      wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -483,7 +469,7 @@ index f8f0076bbd6..13f2febe733 100644
              VK_ACCESS_TRANSFER_READ_BIT,
              back_buffer_vk->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
              back_buffer_vk->image.vk_image, &vk_range);
-@@ -1148,7 +1223,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1148,7 +1209,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
      wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
              0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -492,7 +478,7 @@ index f8f0076bbd6..13f2febe733 100644
              swapchain_vk->vk_images[image_idx], &vk_range);
  
      blit.srcSubresource.aspectMask = vk_range.aspectMask;
-@@ -1180,17 +1255,15 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1180,17 +1241,15 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
              swapchain_vk->vk_images[image_idx], &vk_range);
  
@@ -513,7 +499,7 @@ index f8f0076bbd6..13f2febe733 100644
  
      swapchain_vk->vk_semaphores[present_idx].command_buffer_id = context_vk->current_command_buffer.id;
      wined3d_context_vk_submit_command_buffer(context_vk,
-@@ -1295,7 +1368,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
+@@ -1295,7 +1354,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
                          swapchain_vk, context_vk, src_rect, dst_rect, swap_interval)))
                      ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
              }
@@ -522,7 +508,7 @@ index f8f0076bbd6..13f2febe733 100644
              {
                  ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
              }
-@@ -2078,10 +2151,10 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
+@@ -2078,10 +2137,10 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
          }
  
          if (!width)
