@@ -28,9 +28,9 @@ sleep "$DUR"
 sample | sort -n > /tmp/cpu_b.txt
 echo "=== top CPU (user+sys seconds over ${DUR}s) ==="
 join /tmp/cpu_a.txt /tmp/cpu_b.txt 2>/dev/null | awk -v d="$DUR" '{x=$3-$2; if (x>0) printf "lwp=%s cpu_s=%.1f\n", $1, x/100}' | sort -t= -k3 -nr | head -n 12
-echo "=== wchan of top CPU threads ==="
+echo "=== wchan+comm of top CPU threads ==="
 join /tmp/cpu_a.txt /tmp/cpu_b.txt 2>/dev/null | awk '{x=$3-$2; if (x>0) print $1, x}' | sort -k2 -nr | head -n 12 | while read t _; do
-    echo -n "lwp=$t wchan="; cat /proc/$P/task/$t/wchan 2>/dev/null; echo
+    echo -n "lwp=$t comm=$(cat /proc/$P/task/$t/comm 2>/dev/null) wchan="; cat /proc/$P/task/$t/wchan 2>/dev/null; echo
 done
 rm -f /tmp/cpu_a.txt /tmp/cpu_b.txt
 echo done
