@@ -315,6 +315,21 @@ AviUtl2 で動画再生中に Space キー（またはマウスクリック）�
 
 **現在のアプローチ（2026-07-23）**: `wined3d_swapchain_present` の mutex unlock 後に再入ガード付きで DispatchMessageW。毎フレーム到達し、mutex 解放済み。再入ガード (`static BOOL in_pump`) により Present の再帰呼び出しを安全にスキップ。
 
+### 🔬 トグル経路の静的解析 (2026-09-21・未解決・再開用メモ)
+Space 押下から停止までのアプリ内部経路を逆アセンブルで特定 (Linux 上で完結・Windows 不要)。
+WndProc → プラグインサブクラス連鎖 → `F_big(0x140251760)` → `0x140240f70` →
+`0x140210889` (準備・状態 `+0x320` 読み) → `0x14025aac0` (`CreateEventW` manual-reset) →
+`0x14025acc0` (ジョブ投入＋`WaitForSingleObject(INFINITE)`＋CloseHandle) ×2 →
+`0x14025bd70` 系ゲートキーパー (refcount/state bitops・非ゼロで early-out) →
+状態書き込み＋リスト通知走査＋ `state==3/4` 分岐。
+
+- 分岐候補: ヘルパー内 `+0xa0` フラグ (`==0`→仮想呼出のみで無待機/`!=0`→イベント待機)、
+  ゲートキーパーの非ゼロチェック、state 3/4 分岐。実測の dispatch 所要 (1ms vs 65〜118ms) と対応
+- 除外済み: キーボードフック (未設置)・ホットキー (未輸入)・非同期ポーリング (D&D 用のみ)・
+  RawInput/DirectInput/XInput (未輸入)・CoWait (未輸入)・再生系の Peek (静的に不存在を証明)
+- 次の一手 (未実施): Path-A/B と停止成否の対応付け (Space dispatch への dt ログ＋press 毎の効果観察)。
+  ワインレベルの修正可否はその結果次第。現状で凍結する
+
 ### ✅ 解決（部分的）: 停止操作でのフリーズ解消・停止不可は残存 (2026-09-14)
 再生中の停止操作で「応答がありません」→待機でも復帰しないデッドロックを調査・対処。
 
