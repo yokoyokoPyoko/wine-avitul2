@@ -19,7 +19,7 @@ sample() {
         rest=$(sed 's/^[0-9]* (.*) //' /proc/$P/task/$tid/stat 2>/dev/null) || continue
         set -- $rest
         # $12=utime $13=stime (1-indexed after stripping pid+comm)
-        echo "$tid $(($12+$13))"
+        echo "$tid $((${12}+${13}))"
     done
 }
 
