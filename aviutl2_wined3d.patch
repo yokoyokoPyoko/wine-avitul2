@@ -134,19 +134,27 @@ index bcb89a14d29..7e548a5c9a7 100644
      VkBufferUsageFlags buffer_usage;
      struct wined3d_bo_vk *bo_vk;
 diff --git a/dlls/wined3d/cs.c b/dlls/wined3d/cs.c
-index 9622810f624..99f35203b52 100644
+index 9622810f624..2ad3e8603c7 100644
 --- a/dlls/wined3d/cs.c
 +++ b/dlls/wined3d/cs.c
-@@ -755,7 +755,11 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
+@@ -755,7 +755,19 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
          }
      }
  
 -    ReleaseSemaphore(swapchain->frame_latency_semaphore, 1, NULL);
 +    /* [AviUtl2] Do not release the latency unit for dropped frames (see
 +     * present_dropped). The app-side wait has a timeout, so withholding is
-+     * deadlock-free and paces emission to the real present rate. */
++     * deadlock-free and paces emission to the real present rate. Also
++     * maintain drop_streak for the wrapper's adaptive fail-fast. */
 +    if (!swapchain->present_dropped)
++    {
 +        ReleaseSemaphore(swapchain->frame_latency_semaphore, 1, NULL);
++        InterlockedExchange(&swapchain->drop_streak, 0);
++    }
++    else
++    {
++        InterlockedIncrement(&swapchain->drop_streak);
++    }
  }
  
  void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *swapchain,
@@ -268,13 +276,35 @@ index 42f8307432f..ad07ffa180e 100644
  
      shader_spirv_invalidate_contexts_compute_program(&device_vk->d, program);
 diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
-index f8f0076bbd6..313d46ab8b2 100644
+index f8f0076bbd6..9faa9f1240b 100644
 --- a/dlls/wined3d/swapchain.c
 +++ b/dlls/wined3d/swapchain.c
-@@ -227,12 +227,20 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+@@ -227,12 +227,42 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
      if (flags)
          FIXME("Ignoring flags %#x.\n", flags);
  
++    /* [AviUtl2] Adaptive fail-fast (2026-09-23). When acquires fail
++     * persistently (startup, resize, minimize, stop-teardown), waiting and
++     * emitting per present just burns time (100ms timeout each) and CPU.
++     * After PRESENT_DROP_SKIP_THRESHOLD consecutive drops, and only for
++     * burst emission (UI-rate presents always go through), skip 15/16 calls
++     * outright and retry periodically. Recovery is detected by a successful
++     * retry which resets the streak. Thread-safe via interlocked ops;
++     * slightly stale reads only cause an extra attempt or skip (both safe). */
++    {
++        DWORD now = GetTickCount();
++        LONG streak = InterlockedCompareExchange(&swapchain->drop_streak, 0, 0);
++        DWORD idle_ms = now - swapchain->last_present_tick;
++        swapchain->last_present_tick = now;
++        if (streak >= 5 && idle_ms < 50)
++        {
++            LONG seq = InterlockedIncrement(&swapchain->present_seq);
++            if ((seq % 16) != 0)
++                return WINED3D_OK;
++            /* else fall through for a retry attempt */
++        }
++    }
++
 +    /* [AviUtl2] Bounded frame-latency throttle (2026-09-15).
 +     * Upstream waits INFINITE here; with 0-timeout acquire drops that never
 +     * return the semaphore unit, any sustained drop episode (startup, resize,
@@ -293,7 +323,7 @@ index f8f0076bbd6..313d46ab8b2 100644
      }
  
      wined3d_mutex_lock();
-@@ -264,6 +272,14 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+@@ -264,6 +294,14 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
  
      wined3d_mutex_unlock();
  
@@ -308,7 +338,7 @@ index f8f0076bbd6..313d46ab8b2 100644
      return WINED3D_OK;
  }
  
-@@ -554,9 +570,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
+@@ -554,9 +592,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
      unsigned int i;
      static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
  
@@ -320,7 +350,7 @@ index f8f0076bbd6..313d46ab8b2 100644
  
      texture_prev = wined3d_texture_gl(swapchain->back_buffers[0]);
  
-@@ -927,20 +942,32 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -927,20 +964,32 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      RECT client_rect;
      VkResult vr;
  
@@ -362,7 +392,7 @@ index f8f0076bbd6..313d46ab8b2 100644
  
      if ((vr = VK_CALL(vkGetPhysicalDeviceSurfaceSupportKHR(adapter_vk->physical_device,
              device_vk->graphics_queue.vk_queue_family_index, vk_surface, &supported))) < 0 || !supported)
-@@ -1004,13 +1031,29 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1004,13 +1053,29 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
          goto fail;
      }
  
@@ -396,7 +426,7 @@ index f8f0076bbd6..313d46ab8b2 100644
      }
  
      vk_swapchain_desc.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-@@ -1031,7 +1074,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1031,7 +1096,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      vk_swapchain_desc.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
      vk_swapchain_desc.presentMode = vk_present_mode;
      vk_swapchain_desc.clipped = VK_TRUE;
@@ -405,7 +435,7 @@ index f8f0076bbd6..313d46ab8b2 100644
      if ((vr = VK_CALL(vkCreateSwapchainKHR(device_vk->vk_device, &vk_swapchain_desc, NULL, &vk_swapchain))) < 0)
      {
          ERR("Failed to create Vulkan swapchain, vr %s.\n", wined3d_debug_vkresult(vr));
-@@ -1042,17 +1085,42 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1042,17 +1107,42 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      if (!wined3d_swapchain_vk_create_vulkan_swapchain_images(swapchain_vk, vk_swapchain))
      {
          VK_CALL(vkDestroySwapchainKHR(device_vk->vk_device, vk_swapchain, NULL));
@@ -450,7 +480,7 @@ index f8f0076bbd6..313d46ab8b2 100644
      return E_FAIL;
  }
  
-@@ -1060,8 +1128,6 @@ static HRESULT wined3d_swapchain_vk_recreate(struct wined3d_swapchain_vk *swapch
+@@ -1060,8 +1150,6 @@ static HRESULT wined3d_swapchain_vk_recreate(struct wined3d_swapchain_vk *swapch
  {
      TRACE("swapchain_vk %p.\n", swapchain_vk);
  
@@ -459,7 +489,7 @@ index f8f0076bbd6..313d46ab8b2 100644
      return wined3d_swapchain_vk_create_vulkan_swapchain(swapchain_vk);
  }
  
-@@ -1109,12 +1175,22 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1109,12 +1197,22 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
  
      present_idx = swapchain_vk->current++ % swapchain_vk->image_count;
      wined3d_context_vk_wait_command_buffer(context_vk, swapchain_vk->vk_semaphores[present_idx].command_buffer_id);
@@ -484,7 +514,7 @@ index f8f0076bbd6..313d46ab8b2 100644
  
      if (dst_rect->right > swapchain_vk->width || dst_rect->bottom > swapchain_vk->height)
      {
-@@ -1140,7 +1216,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1140,7 +1238,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
  
      wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -493,7 +523,7 @@ index f8f0076bbd6..313d46ab8b2 100644
              VK_ACCESS_TRANSFER_READ_BIT,
              back_buffer_vk->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
              back_buffer_vk->image.vk_image, &vk_range);
-@@ -1148,7 +1224,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1148,7 +1246,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
      wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
              0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -502,7 +532,7 @@ index f8f0076bbd6..313d46ab8b2 100644
              swapchain_vk->vk_images[image_idx], &vk_range);
  
      blit.srcSubresource.aspectMask = vk_range.aspectMask;
-@@ -1180,17 +1256,15 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1180,17 +1278,15 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
              swapchain_vk->vk_images[image_idx], &vk_range);
  
@@ -523,7 +553,7 @@ index f8f0076bbd6..313d46ab8b2 100644
  
      swapchain_vk->vk_semaphores[present_idx].command_buffer_id = context_vk->current_command_buffer.id;
      wined3d_context_vk_submit_command_buffer(context_vk,
-@@ -1295,7 +1369,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
+@@ -1295,7 +1391,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
                          swapchain_vk, context_vk, src_rect, dst_rect, swap_interval)))
                      ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
              }
@@ -532,7 +562,7 @@ index f8f0076bbd6..313d46ab8b2 100644
              {
                  ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
              }
-@@ -2078,10 +2152,10 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
+@@ -2078,10 +2174,10 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
          }
  
          if (!width)
@@ -964,10 +994,10 @@ index 1269c1fd409..140bf11a539 100644
              TRACE("Limiting HS shader model to %u.\n", wined3d_settings.max_sm_hs);
          if (!get_config_key_dword(hkey, appkey, env, "MaxShaderModelDS", &wined3d_settings.max_sm_ds))
 diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
-index 4b8812af783..4ffdecc0616 100644
+index 4b8812af783..352cc557ce8 100644
 --- a/dlls/wined3d/wined3d_private.h
 +++ b/dlls/wined3d/wined3d_private.h
-@@ -4119,6 +4119,12 @@ struct wined3d_swapchain
+@@ -4119,6 +4119,22 @@ struct wined3d_swapchain
      unsigned int swap_interval;
      unsigned int max_frame_latency;
      HANDLE frame_latency_semaphore;
@@ -977,6 +1007,16 @@ index 4b8812af783..4ffdecc0616 100644
 +     * immediately and the throttle never paces the app (thousands of
 +     * dropped presents per second, seconds of pipeline latency). */
 +    BOOL present_dropped;
++    /* [AviUtl2] Adaptive fail-fast state (2026-09-23). drop_streak counts
++     * consecutive dropped presents (CS thread, interlocked); present_seq
++     * numbers wrapper calls; last_present_tick gates skipping to burst
++     * emission so low-rate UI presents are never skipped. When backups
++     * persist, the wrapper returns early instead of waiting+emitting, so
++     * stop-drain and teardown proceed at full speed instead of paying the
++     * throttle timeout per present. Zero-initialized (calloc). */
++    LONG drop_streak;
++    LONG present_seq;
++    DWORD last_present_tick;
  
      /* Performance tracking */
      LARGE_INTEGER last_present_time;
