@@ -316,7 +316,7 @@ AviUtl2 で動画再生中に Space キー（またはマウスクリック）�
 **現在のアプローチ（2026-07-23）**: `wined3d_swapchain_present` の mutex unlock 後に再入ガード付きで DispatchMessageW。毎フレーム到達し、mutex 解放済み。再入ガード (`static BOOL in_pump`) により Present の再帰呼び出しを安全にスキップ。
 
 ### ✅ 実用解決: CPU affinity で停止が安定 (2026-09-21: 制限あり 0.5〜1秒×5 / なし 28秒・×4)
-taskset 実験で決定打。12 コア ve `taskset -c 0-3` (4 コア):
+taskset 実験で決定打。12 コアでは `taskset -c 0-3` (4 コア):
 - 制限あり: `0.5s,1s,1s,0.5s,1s` (全て停止)
 - 制限なし: `28s,x,x,x,29s` (ほぼ停止せず)
 トグルはジョブ投入＋完了待ち構造のため、スレッドの割り込みタイミングで成否が変わる。
