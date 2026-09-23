@@ -268,21 +268,20 @@ index 42f8307432f..ad07ffa180e 100644
  
      shader_spirv_invalidate_contexts_compute_program(&device_vk->d, program);
 diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
-index f8f0076bbd6..c7cb42303dd 100644
+index f8f0076bbd6..313d46ab8b2 100644
 --- a/dlls/wined3d/swapchain.c
 +++ b/dlls/wined3d/swapchain.c
-@@ -227,12 +227,21 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+@@ -227,12 +227,20 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
      if (flags)
          FIXME("Ignoring flags %#x.\n", flags);
  
-+    /* [AviUtl2] Bounded frame-latency throttle (2026-09-15, tuned 2026-09-23).
++    /* [AviUtl2] Bounded frame-latency throttle (2026-09-15).
 +     * Upstream waits INFINITE here; with 0-timeout acquire drops that never
 +     * return the semaphore unit, any sustained drop episode (startup, resize,
-+     * minimize, stop-teardown) deadlocks the app permanently. A 100ms timeout
-+     * proved safe but makes stop-drain pay 100ms per dropped present
-+     * (~30 x 100ms = ~3s stop delay, measured 2026-09-23). 16ms (one frame
-+     * time) keeps deadlock safety while draining ~6x faster and still caps
-+     * backup emission at ~60/s (vs 4000+/s unfettered).
++     * minimize, stop-teardown) deadlocks the app permanently. A bounded
++     * timeout preserves deadlock safety. 16ms was tried (2026-09-23) to speed
++     * stop-drain but reintroduced spinning under backup (~60/s emit rate, fan
++     * noise / log spam reported as 空転復活), so this stays at 100ms.
 +     * The wait runs BEFORE taking the mutex, so other threads are unaffected. */
      if (!(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT))
      {
@@ -290,11 +289,11 @@ index f8f0076bbd6..c7cb42303dd 100644
           * get ahead of the worker thread. Avoid holding the D3D mutex across
           * to not block other threads. */
 -        WaitForSingleObject(swapchain->frame_latency_semaphore, INFINITE);
-+        WaitForSingleObject(swapchain->frame_latency_semaphore, 16);
++        WaitForSingleObject(swapchain->frame_latency_semaphore, 100);
      }
  
      wined3d_mutex_lock();
-@@ -264,6 +273,14 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+@@ -264,6 +272,14 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
  
      wined3d_mutex_unlock();
  
@@ -309,7 +308,7 @@ index f8f0076bbd6..c7cb42303dd 100644
      return WINED3D_OK;
  }
  
-@@ -554,9 +571,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
+@@ -554,9 +570,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
      unsigned int i;
      static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
  
@@ -321,7 +320,7 @@ index f8f0076bbd6..c7cb42303dd 100644
  
      texture_prev = wined3d_texture_gl(swapchain->back_buffers[0]);
  
-@@ -927,20 +943,32 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -927,20 +942,32 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      RECT client_rect;
      VkResult vr;
  
@@ -363,7 +362,7 @@ index f8f0076bbd6..c7cb42303dd 100644
  
      if ((vr = VK_CALL(vkGetPhysicalDeviceSurfaceSupportKHR(adapter_vk->physical_device,
              device_vk->graphics_queue.vk_queue_family_index, vk_surface, &supported))) < 0 || !supported)
-@@ -1004,13 +1032,29 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1004,13 +1031,29 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
          goto fail;
      }
  
@@ -397,7 +396,7 @@ index f8f0076bbd6..c7cb42303dd 100644
      }
  
      vk_swapchain_desc.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-@@ -1031,7 +1075,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1031,7 +1074,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      vk_swapchain_desc.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
      vk_swapchain_desc.presentMode = vk_present_mode;
      vk_swapchain_desc.clipped = VK_TRUE;
@@ -406,7 +405,7 @@ index f8f0076bbd6..c7cb42303dd 100644
      if ((vr = VK_CALL(vkCreateSwapchainKHR(device_vk->vk_device, &vk_swapchain_desc, NULL, &vk_swapchain))) < 0)
      {
          ERR("Failed to create Vulkan swapchain, vr %s.\n", wined3d_debug_vkresult(vr));
-@@ -1042,17 +1086,42 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1042,17 +1085,42 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      if (!wined3d_swapchain_vk_create_vulkan_swapchain_images(swapchain_vk, vk_swapchain))
      {
          VK_CALL(vkDestroySwapchainKHR(device_vk->vk_device, vk_swapchain, NULL));
@@ -451,7 +450,7 @@ index f8f0076bbd6..c7cb42303dd 100644
      return E_FAIL;
  }
  
-@@ -1060,8 +1129,6 @@ static HRESULT wined3d_swapchain_vk_recreate(struct wined3d_swapchain_vk *swapch
+@@ -1060,8 +1128,6 @@ static HRESULT wined3d_swapchain_vk_recreate(struct wined3d_swapchain_vk *swapch
  {
      TRACE("swapchain_vk %p.\n", swapchain_vk);
  
@@ -460,7 +459,7 @@ index f8f0076bbd6..c7cb42303dd 100644
      return wined3d_swapchain_vk_create_vulkan_swapchain(swapchain_vk);
  }
  
-@@ -1109,12 +1176,22 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1109,12 +1175,22 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
  
      present_idx = swapchain_vk->current++ % swapchain_vk->image_count;
      wined3d_context_vk_wait_command_buffer(context_vk, swapchain_vk->vk_semaphores[present_idx].command_buffer_id);
@@ -485,7 +484,7 @@ index f8f0076bbd6..c7cb42303dd 100644
  
      if (dst_rect->right > swapchain_vk->width || dst_rect->bottom > swapchain_vk->height)
      {
-@@ -1140,7 +1217,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1140,7 +1216,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
  
      wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -494,7 +493,7 @@ index f8f0076bbd6..c7cb42303dd 100644
              VK_ACCESS_TRANSFER_READ_BIT,
              back_buffer_vk->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
              back_buffer_vk->image.vk_image, &vk_range);
-@@ -1148,7 +1225,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1148,7 +1224,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
      wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
              0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -503,7 +502,7 @@ index f8f0076bbd6..c7cb42303dd 100644
              swapchain_vk->vk_images[image_idx], &vk_range);
  
      blit.srcSubresource.aspectMask = vk_range.aspectMask;
-@@ -1180,17 +1257,15 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1180,17 +1256,15 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
              swapchain_vk->vk_images[image_idx], &vk_range);
  
@@ -524,7 +523,7 @@ index f8f0076bbd6..c7cb42303dd 100644
  
      swapchain_vk->vk_semaphores[present_idx].command_buffer_id = context_vk->current_command_buffer.id;
      wined3d_context_vk_submit_command_buffer(context_vk,
-@@ -1295,7 +1370,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
+@@ -1295,7 +1369,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
                          swapchain_vk, context_vk, src_rect, dst_rect, swap_interval)))
                      ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
              }
@@ -533,7 +532,7 @@ index f8f0076bbd6..c7cb42303dd 100644
              {
                  ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
              }
-@@ -2078,10 +2153,10 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
+@@ -2078,10 +2152,10 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
          }
  
          if (!width)
