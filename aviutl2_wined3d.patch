@@ -134,10 +134,10 @@ index bcb89a14d29..7e548a5c9a7 100644
      VkBufferUsageFlags buffer_usage;
      struct wined3d_bo_vk *bo_vk;
 diff --git a/dlls/wined3d/cs.c b/dlls/wined3d/cs.c
-index 9622810f624..99f35203b52 100644
+index 9622810f624..0ece0428b8b 100644
 --- a/dlls/wined3d/cs.c
 +++ b/dlls/wined3d/cs.c
-@@ -755,7 +755,11 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
+@@ -755,7 +755,12 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
          }
      }
  
@@ -147,9 +147,21 @@ index 9622810f624..99f35203b52 100644
 +     * deadlock-free and paces emission to the real present rate. */
 +    if (!swapchain->present_dropped)
 +        ReleaseSemaphore(swapchain->frame_latency_semaphore, 1, NULL);
++    InterlockedDecrement(&swapchain->outstanding_presents);
  }
  
  void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *swapchain,
+@@ -782,6 +787,10 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
+         wined3d_resource_reference(&swapchain->back_buffers[i]->resource);
+     }
+ 
++    /* Counted before submit: past this point the op is visible to the CS
++     * thread, which decrements on execution. Keeps wrapper skip accurate. */
++    InterlockedIncrement(&swapchain->outstanding_presents);
++
+     wined3d_device_context_submit(&cs->c, WINED3D_CS_QUEUE_DEFAULT);
+ }
+ 
 diff --git a/dlls/wined3d/decoder.c b/dlls/wined3d/decoder.c
 index e88776ce9a1..7015ce4cf4b 100644
 --- a/dlls/wined3d/decoder.c
@@ -268,13 +280,23 @@ index 42f8307432f..ad07ffa180e 100644
  
      shader_spirv_invalidate_contexts_compute_program(&device_vk->d, program);
 diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
-index f8f0076bbd6..c5c8be2e646 100644
+index f8f0076bbd6..34dbf124b18 100644
 --- a/dlls/wined3d/swapchain.c
 +++ b/dlls/wined3d/swapchain.c
-@@ -227,12 +227,20 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+@@ -227,12 +227,30 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
      if (flags)
          FIXME("Ignoring flags %#x.\n", flags);
  
++    /* [AviUtl2] Cap in-flight presents (2026-09-24). Floods of thousands of
++     * presents per second (99% dropped downstream) waste power, droop clocks
++     * and bloat stop latency, and semaphore waits cannot pace paths that
++     * skip them. Dropping the excess here costs ~100ns instead of a full CS
++     * round trip, never blocks, and bounds pipeline latency to a few frames.
++     * Healthy paths (CS keeps up, few outstanding) never hit the cap. */
++    if (InterlockedCompareExchange(&swapchain->outstanding_presents, 0, 0)
++            >= swapchain->max_frame_latency)
++        return WINED3D_OK;
++
 +    /* [AviUtl2] Bounded frame-latency throttle (2026-09-15).
 +     * Upstream waits INFINITE here; with 0-timeout acquire drops that never
 +     * return the semaphore unit, any sustained drop episode (startup, resize,
@@ -293,7 +315,7 @@ index f8f0076bbd6..c5c8be2e646 100644
      }
  
      wined3d_mutex_lock();
-@@ -264,6 +272,14 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+@@ -264,6 +282,14 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
  
      wined3d_mutex_unlock();
  
@@ -308,7 +330,7 @@ index f8f0076bbd6..c5c8be2e646 100644
      return WINED3D_OK;
  }
  
-@@ -554,9 +570,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
+@@ -554,9 +580,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
      unsigned int i;
      static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
  
@@ -320,7 +342,7 @@ index f8f0076bbd6..c5c8be2e646 100644
  
      texture_prev = wined3d_texture_gl(swapchain->back_buffers[0]);
  
-@@ -927,20 +942,32 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -927,20 +952,32 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      RECT client_rect;
      VkResult vr;
  
@@ -362,7 +384,7 @@ index f8f0076bbd6..c5c8be2e646 100644
  
      if ((vr = VK_CALL(vkGetPhysicalDeviceSurfaceSupportKHR(adapter_vk->physical_device,
              device_vk->graphics_queue.vk_queue_family_index, vk_surface, &supported))) < 0 || !supported)
-@@ -1007,7 +1034,9 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1007,7 +1044,9 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      vk_present_mode = VK_PRESENT_MODE_FIFO_KHR;
      if (!swapchain_vk->s.swap_interval)
      {
@@ -373,7 +395,7 @@ index f8f0076bbd6..c5c8be2e646 100644
              vk_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
          else
              FIXME("Unsupported swap interval %u.\n", swapchain_vk->s.swap_interval);
-@@ -1031,7 +1060,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1031,7 +1070,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      vk_swapchain_desc.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
      vk_swapchain_desc.presentMode = vk_present_mode;
      vk_swapchain_desc.clipped = VK_TRUE;
@@ -382,7 +404,7 @@ index f8f0076bbd6..c5c8be2e646 100644
      if ((vr = VK_CALL(vkCreateSwapchainKHR(device_vk->vk_device, &vk_swapchain_desc, NULL, &vk_swapchain))) < 0)
      {
          ERR("Failed to create Vulkan swapchain, vr %s.\n", wined3d_debug_vkresult(vr));
-@@ -1042,17 +1071,42 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+@@ -1042,17 +1081,42 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
      if (!wined3d_swapchain_vk_create_vulkan_swapchain_images(swapchain_vk, vk_swapchain))
      {
          VK_CALL(vkDestroySwapchainKHR(device_vk->vk_device, vk_swapchain, NULL));
@@ -427,7 +449,7 @@ index f8f0076bbd6..c5c8be2e646 100644
      return E_FAIL;
  }
  
-@@ -1060,8 +1114,6 @@ static HRESULT wined3d_swapchain_vk_recreate(struct wined3d_swapchain_vk *swapch
+@@ -1060,8 +1124,6 @@ static HRESULT wined3d_swapchain_vk_recreate(struct wined3d_swapchain_vk *swapch
  {
      TRACE("swapchain_vk %p.\n", swapchain_vk);
  
@@ -436,7 +458,7 @@ index f8f0076bbd6..c5c8be2e646 100644
      return wined3d_swapchain_vk_create_vulkan_swapchain(swapchain_vk);
  }
  
-@@ -1109,12 +1161,22 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1109,12 +1171,22 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
  
      present_idx = swapchain_vk->current++ % swapchain_vk->image_count;
      wined3d_context_vk_wait_command_buffer(context_vk, swapchain_vk->vk_semaphores[present_idx].command_buffer_id);
@@ -461,7 +483,7 @@ index f8f0076bbd6..c5c8be2e646 100644
  
      if (dst_rect->right > swapchain_vk->width || dst_rect->bottom > swapchain_vk->height)
      {
-@@ -1140,7 +1202,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1140,7 +1212,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
  
      wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -470,7 +492,7 @@ index f8f0076bbd6..c5c8be2e646 100644
              VK_ACCESS_TRANSFER_READ_BIT,
              back_buffer_vk->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
              back_buffer_vk->image.vk_image, &vk_range);
-@@ -1148,7 +1210,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1148,7 +1220,7 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
      wined3d_context_vk_image_barrier(context_vk, vk_command_buffer,
              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
              0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -479,7 +501,7 @@ index f8f0076bbd6..c5c8be2e646 100644
              swapchain_vk->vk_images[image_idx], &vk_range);
  
      blit.srcSubresource.aspectMask = vk_range.aspectMask;
-@@ -1180,17 +1242,15 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+@@ -1180,17 +1252,15 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
              swapchain_vk->vk_images[image_idx], &vk_range);
  
@@ -500,7 +522,7 @@ index f8f0076bbd6..c5c8be2e646 100644
  
      swapchain_vk->vk_semaphores[present_idx].command_buffer_id = context_vk->current_command_buffer.id;
      wined3d_context_vk_submit_command_buffer(context_vk,
-@@ -1295,7 +1355,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
+@@ -1295,7 +1365,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
                          swapchain_vk, context_vk, src_rect, dst_rect, swap_interval)))
                      ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
              }
@@ -509,7 +531,7 @@ index f8f0076bbd6..c5c8be2e646 100644
              {
                  ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
              }
-@@ -2078,10 +2138,10 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
+@@ -2078,10 +2148,10 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
          }
  
          if (!width)
@@ -941,10 +963,10 @@ index 1269c1fd409..140bf11a539 100644
              TRACE("Limiting HS shader model to %u.\n", wined3d_settings.max_sm_hs);
          if (!get_config_key_dword(hkey, appkey, env, "MaxShaderModelDS", &wined3d_settings.max_sm_ds))
 diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
-index 4b8812af783..e27c2b37fcc 100644
+index 4b8812af783..c047bfb705f 100644
 --- a/dlls/wined3d/wined3d_private.h
 +++ b/dlls/wined3d/wined3d_private.h
-@@ -4119,6 +4119,11 @@ struct wined3d_swapchain
+@@ -4119,6 +4119,17 @@ struct wined3d_swapchain
      unsigned int swap_interval;
      unsigned int max_frame_latency;
      HANDLE frame_latency_semaphore;
@@ -953,6 +975,12 @@ index 4b8812af783..e27c2b37fcc 100644
 +     * for dropped frames, otherwise drops recycle the semaphore unit
 +     * immediately and the throttle never paces the app. */
 +    BOOL present_dropped;
++    /* [AviUtl2] Count of emitted but unexecuted present ops (2026-09-24).
++     * The wrapper skips emission past max_frame_latency outstanding presents
++     * instead of queueing unboundedly. Unlike semaphore waits this never
++     * blocks (no stalls, no vsync quantization, no deadlock class) and works
++     * regardless of WAITABLE flags or present modes. Zero-initialized. */
++    LONG outstanding_presents;
  
      /* Performance tracking */
      LARGE_INTEGER last_present_time;
