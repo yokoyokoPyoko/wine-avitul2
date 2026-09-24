@@ -390,6 +390,16 @@ WndProc → プラグインサブクラス連鎖 → `F_big(0x140251760)` → `0
 Wine D3D 層からは直接触れないため、GPU プロファイリング (apitrace/RenderDoc 等) が
 できる条件が揃うまで凍結する。再開時の要点: gap 時刻・スレッド特定は上記ログと
 `logs/` 内の解析手順で再現可能。現状 (0〜4秒安定・フリーズなし) で実用決着とする。
+
+#### GPU 緩和策の検証結果 (2026-09-24: ZL1/ZL2 無効・Wayland 不可で凍結)
+- 環境: Radeon 840M (RDNA3.5) / Mesa 25.2.8 / kernel 6.17 / GNOME Wayland+Xwayland。
+  電力は balanced、CPU governor は performance
+- ZL1 プラットフォーム性能化 (`platform_profile` balanced→performance): **効果なし**
+- ZL2 GPU 固定 (`power_dpm_force_performance_level=high`): **効果なし**
+- Wayland ネイティブ動作 (`winewayland.drv` 同梱あり・`Graphics=wayland` で切替):
+  **描画できず試験不可**。Xorg セッション試験はユーザーが辞退。よって表示サーバー要因は未検証のまま
+  (復帰手順: `wine reg delete "HKCU\Software\Wine\Drivers" /v Graphics /f`。`~/.wine/user.reg.bak-x11` に退避あり)
+- Mesa 更新・カーネル変更は未実施 (効果の根拠がなくリスクのみのため見送り)
 - F_main 経由の dispatch は正常・即時復帰するが、トグル実行後に映像が継続する回がある
 - デコード停止とプレゼント停止の順序・間隔は回ごとに変動。単発 Space でデコードが 76ms で止まる回も、
   22 秒無視される回もある (同一バイナリ・同一操作)。トグル内部の状態競合とみられる
