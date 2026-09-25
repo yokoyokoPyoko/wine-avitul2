@@ -146,6 +146,38 @@ Vulkan バックエンドで G8R8_G8B8_UNORM を正しく扱うために以下�
 | `aviutl2_d3d11_dwrite.patch` | `programs/wineopenfolder/main.c` | wineopenfolder.exe | ✅ |
 | `aviutl2_user32.patch` | `dlls/user32/message.c` | PeekMessageW VK_SPACE dispatch 介入（再生中には到達せず無効） | ❌ 無効確認済み |
 
+## 解決済み: ffmpegOut の h264_vulkan エクスポート失敗 (2026-09-25)
+
+### 症状
+ffmpegOut 2.05 で出力 → `h264_vulkan` が即失敗。
+`[Vulkan] Failed to allocate memory: VK_ERROR_OUT_OF_HOST_MEMORY` → hwupload 不可 → エンコーダ未開封。
+
+### 根本原因 (2段構え)
+1. **Wine のバグ**: ffmpeg は `VkExportMemoryAllocateInfo` を `handleTypes=0` で
+   チェーンする (export 拡張未使用時)。`dlls/win32u/vulkan.c` の
+   `win32u_vkAllocateMemory` は非-Win32 タイプでも fd-export＋D3DKMT ラップを強行し、
+   `failed:` で一律 `OUT_OF_HOST_MEMORY` を返していた。spec 上 0 は no-export のため、
+   該当時は `export_info=NULL` で素の確保に落とす修正を適用。
+2. **デプロイ先の誤り**: 64bit プロセスが実際に読むのは
+   `/opt/wine-staging/lib/wine/x86_64-unix/win32u.so` であり、
+   `deploy_dlls.sh` は誤って `x86_64-windows/` にだけ置いていた。スクリプトを両配置に修正。
+3. **ツリービルドに Vulkan 無効**: ツリーは Vulkan ヘッダなしで configure されており
+   (`SONAME_LIBVULKAN` 未定義)、自前ビルドの win32u では Vulkan 初期化自体が失敗する。
+   `libvulkan-dev` 導入＋再 configure 済み。再構成後はツリー産 win32u で Vulkan 有効を確認。
+
+### 検証
+- プラグイン同梱 `ffmpeg.exe` を単体実行
+  (`-init_hw_device vulkan=vk:0 ... -vf format=nv12,hwupload -c:v h264_vulkan -f null -`):
+  修正前は確保失敗、修正後は **exit=0・5フレームをエンコード**
+- ネイティブ ffmpeg での同パス成功により Wine 固有と断定して修正した
+- AviUtl2 本体は 45秒起動安定・回帰なし
+- なお旧ツリー由来の SUBOPTIMAL 抑制 (win32u 側) は 11.16 worktree に移植漏れのまま
+  だったが、素の unixlib で問題なく動作しているため**不要と判断し復活させない**。
+  親パッチ再生成で自然に脱落済み
+
+### 回避策 (HW が使えない場合)
+ffmpegOut の設定でソフトウェア `libx264` を選ぶ (単体実行で exit=0 確認済み)
+
 ## 解決済み: Vulkan バックエンドの「1フレーム遅れ」問題 (2026-05-18)
 
 ### 修正内容

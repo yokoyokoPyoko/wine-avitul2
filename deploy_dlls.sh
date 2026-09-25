@@ -70,10 +70,16 @@ for pair in "wined3d:wined3d" "d3d11:d3d11" "comdlg32:comdlg32" "shell32:shell32
 done
 
 # win32u.so (unixlib, /opt only - no system32 counterpart)
+# NOTE: the live 64-bit unixlib is x86_64-unix/, NOT x86_64-windows/.
+# Deploy to both to keep them in sync.
 WIN32U_SRC="$WINE_SOURCE/dlls/win32u/win32u.so"
 if [ -f "$WIN32U_SRC" ]; then
+    opt_backup_once "/opt/wine-staging/lib/wine/x86_64-unix/win32u.so"
     opt_backup_once "$OPT_DIR/win32u.so"
-    opt_cp "$WIN32U_SRC" "$OPT_DIR/"
+    if [ "$SKIP_OPT" != 1 ]; then
+        sudo cp "$WIN32U_SRC" "/opt/wine-staging/lib/wine/x86_64-unix/"
+        sudo cp "$WIN32U_SRC" "$OPT_DIR/"
+    fi
     echo "deployed win32u.so"
 else
     echo "WARNING: $WIN32U_SRC not found, skipping win32u.so" >&2
